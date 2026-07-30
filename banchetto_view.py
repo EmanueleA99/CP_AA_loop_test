@@ -108,7 +108,7 @@ def ensure_deep_sleep_csv():
         if not model.CONFIG.CSV_OUTPUT_DEEP_SLEEP.exists():
             with open(model.CONFIG.CSV_OUTPUT_DEEP_SLEEP, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["timestamp", "status", "detail"])
+                writer.writerow(["Timestamp evento", "Stato test", "Last Mode", "Connection time"])
         return True
     except Exception as e:
         print(f"Impossibile inizializzare il CSV output_deep_sleep: {e}")
@@ -116,8 +116,8 @@ def ensure_deep_sleep_csv():
         return False
 
 
-def append_deep_sleep_csv(status, detail):
-    """Aggiunge una riga al CSV di output deep sleep."""
+def append_deep_sleep_csv(stato_test, last_mode, connection_time):
+    """Aggiunge una riga al CSV di output deep sleep con le colonne strutturate."""
     try:
         if not ensure_deep_sleep_csv():
             return False
@@ -126,8 +126,9 @@ def append_deep_sleep_csv(status, detail):
             writer = csv.writer(f)
             writer.writerow([
                 time.strftime("%Y-%m-%d %H:%M:%S"),
-                status,
-                detail
+                stato_test,
+                last_mode,
+                connection_time
             ])
         return True
     except Exception as e:
@@ -136,35 +137,34 @@ def append_deep_sleep_csv(status, detail):
         return False
 
 
-def log_output_deep_sleep_passed():
-    """Registra il risultato PASS nel CSV deep sleep."""
+def _format_connection_time():
+    """Formatta il tempo di connessione (primo click relay -> icona verde) per il CSV."""
     if model.second_relay_to_green_elapsed is None:
-        detail = "Test PASSED: icona verde rilevata, ma tempo secondo click->verde non disponibile"
-    else:
-        detail = (
-            f"Test PASSED: icona verde rilevata in {model.format_elapsed(model.second_relay_to_green_elapsed)} "
-            f"dal secondo click relay"
-        )
-    append_deep_sleep_csv("PASSED", detail)
+        return "N/A"
+    return f"{model.second_relay_to_green_elapsed:.2f}"
+
+
+def log_output_deep_sleep_passed():
+    """Registra il risultato PASSED nel CSV deep sleep: icona verde + CarPlay in foreground."""
+    connection_time = _format_connection_time()
+    detail = f"Test PASSED: icona verde rilevata, CarPlay in foreground. Connection time: {connection_time}s"
+    append_deep_sleep_csv("PASSED", "PASSED", connection_time)
     safe_log_line(f"output_deep_sleep -> PASSED | {detail}")
 
 
 def log_output_deep_sleep_partially_failed(avg_score):
-    """Registra un risultato PARTIALLY FAILED nel CSV deep sleep."""
-    if model.second_relay_to_green_elapsed is None:
-        timing = "tempo secondo click->verde non disponibile"
-    else:
-        timing = f"icona verde rilevata in {model.format_elapsed(model.second_relay_to_green_elapsed)} dal secondo click relay"
-
+    """Registra un risultato PARTIALLY PASSED: icona verde ok, ma CarPlay non in foreground."""
+    connection_time = _format_connection_time()
     detail = (
-        f"Test PARTIALLY FAILED: {timing}, ma schermata CarPlay non rilevata. "
-        f"Similarita media finale: {avg_score:.3f}"
+        f"Test PARTIALLY PASSED: icona verde rilevata, ma schermata CarPlay non in foreground "
+        f"(similarita media finale: {avg_score:.3f}). Connection time: {connection_time}s"
     )
-    append_deep_sleep_csv("PARTIALLY FAILED", detail)
-    safe_log_line(f"output_deep_sleep -> PARTIALLY FAILED | {detail}")
+    append_deep_sleep_csv("PARTIALLY PASSED", "FAILED", connection_time)
+    safe_log_line(f"output_deep_sleep -> PARTIALLY PASSED | {detail}")
 
 
 def log_output_deep_sleep_failed(reason):
-    """Registra un risultato FAIL nel CSV deep sleep."""
-    append_deep_sleep_csv("FAILED", reason)
+    """Registra un risultato FAILED: icona verde non rilevata, CarPlay non avviato."""
+    connection_time = _format_connection_time()
+    append_deep_sleep_csv("FAILED", "N/A", connection_time)
     safe_log_line(f"output_deep_sleep -> FAILED | {reason}")
