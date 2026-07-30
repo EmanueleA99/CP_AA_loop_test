@@ -1,0 +1,15 @@
+# Cartelle escluse specificate
+output/
+venv/
+__pycache__/
+
+# File di cache e compilati Python (per sicurezza extra)
+*.pyc
+
+# Eventuali file d'ambiente e segreti
+.env
+*.env
+
+# Configurazione degli editor (VS Code, PyCharm, ecc.)
+.vscode/
+.idea/
