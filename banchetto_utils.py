@@ -10,6 +10,13 @@ from PIL import Image
 import banchetto_model as model
 import banchetto_view as view
 
+import struct
+
+def ensure_bgr_array(image_input):
+    """Accetta sia un array NumPy (BGR) che byte PNG, restituendo sempre un array BGR."""
+    if isinstance(image_input, np.ndarray):
+        return image_input
+    return png_to_bgr_array(image_input)
 
 def save_png(png_bytes, filename):
     """Salva uno screenshot PNG nella cartella sessione."""
@@ -18,15 +25,46 @@ def save_png(png_bytes, filename):
         f.write(png_bytes)
     return path
 
-
-def capture_png(serial):
-    """Acquisisce uno screenshot dal device via ADB e ritorna i byte PNG."""
+def capture_frame_bgr(serial):
+    """Cattura lo schermo via ADB e restituisce una matrice OpenCV BGR in memoria (ultra-veloce)."""
     timeout = getattr(model.CONFIG, "ADB_COMMAND_TIMEOUT_SECONDS", 10)
     cmd = [model.CONFIG.ADB, "-s", serial, "exec-out", "screencap"]
     display_id = getattr(model.CONFIG, "SCREEN_DISPLAY_ID", None)
     if display_id is not None:
         cmd += ["-d", str(display_id)]
-    cmd.append("-p")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        raw = result.stdout
+        if len(raw) < 12:
+            return None
+
+        width, height, _ = struct.unpack("<III", raw[:12])
+        expected_len = width * height * 4
+        header_size = len(raw) - expected_len
+        
+        pixel_data = raw[header_size : header_size + expected_len]
+        img_rgba = np.frombuffer(pixel_data, dtype=np.uint8).reshape((height, width, 4))
+        
+        # Converte da RGBA ad BGR per l'analisi immediata
+        return cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
+    except Exception:
+        return None
+
+def bgr_to_png(img_bgr):
+    """Converte una matrice BGR in byte PNG solo quando occorre salvarla."""
+    _, encoded_png = cv2.imencode('.png', img_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    return encoded_png.tobytes()
+
+def capture_png(serial):
+    """Acquisisce uno screenshot via ADB in modalità RAW (veloce) e lo converte in PNG sul PC."""
+    timeout = getattr(model.CONFIG, "ADB_COMMAND_TIMEOUT_SECONDS", 10)
+    
+    # Rimuoviamo '-p' per evitare che lo smartphone perda tempo a comprimere il PNG
+    cmd = [model.CONFIG.ADB, "-s", serial, "exec-out", "screencap"]
+    display_id = getattr(model.CONFIG, "SCREEN_DISPLAY_ID", None)
+    if display_id is not None:
+        cmd += ["-d", str(display_id)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=timeout)
@@ -37,29 +75,50 @@ def capture_png(serial):
         return None
 
     raw = result.stdout
-    if raw.startswith(b"\x89PNG"):
-        return raw
+    if len(raw) < 12:
+        msg = f"screencap ADB ha restituito dati insufficienti ({len(raw)} bytes)"
+        print(msg)
+        view.safe_log_line(msg)
+        return None
 
-    stderr_text = result.stderr.decode(errors="replace").strip() if result.stderr else ""
-    msg = (
-        f"screencap ADB non ha prodotto un PNG valido: returncode={result.returncode}, "
-        f"bytes_stdout={len(raw)}, stderr='{stderr_text}'"
-    )
-    print(msg)
-    view.safe_log_line(msg)
+    try:
+        # I primi 12 byte dell'header RAW contengono: Width (4b), Height (4b), PixelFormat (4b)
+        width, height, _ = struct.unpack("<III", raw[:12])
+        expected_data_len = width * height * 4  # 4 byte per pixel (RGBA)
+
+        # Calcolo dinamico dell'header (12 byte su Android vecchi, 16 byte su Android 7+)
+        header_size = len(raw) - expected_data_len
+        if header_size < 12:
+            raise ValueError(f"Payload incompleto: ricevuti {len(raw)} byte, attesi almeno {expected_data_len + 12}")
+
+        # Estragga il buffer dei pixel e converte in matrice NumPy RGBA
+        pixel_data = raw[header_size : header_size + expected_data_len]
+        img_rgba = np.frombuffer(pixel_data, dtype=np.uint8).reshape((height, width, 4))
+
+        # Converti da RGBA (Android) a BGR (OpenCV)
+        img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
+
+        # Compressione PNG ultra-rapida sul PC (Livello 1)
+        success, encoded_png = cv2.imencode('.png', img_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        if success:
+            return encoded_png.tobytes()
+
+    except Exception as e:
+        msg = f"Errore nella decodifica dello screenshot RAW: {e}"
+        print(msg)
+        view.safe_log_line(msg)
+        return None
+
     return None
-
 
 def png_to_gray_array(png_bytes):
     """Converte un PNG in memoria in un array in scala di grigi."""
     return np.array(Image.open(BytesIO(png_bytes)).convert("L"))
 
-
 def png_to_bgr_array(png_bytes):
     """Converte un PNG in memoria in un array BGR per OpenCV."""
     rgb = np.array(Image.open(BytesIO(png_bytes)).convert("RGB"))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
 
 def similarity_score(reference_path, png_bytes):
     """Calcola la similarità tra screenshot e immagine di riferimento."""
@@ -72,7 +131,6 @@ def similarity_score(reference_path, png_bytes):
     result = cv2.matchTemplate(frame, ref, cv2.TM_CCOEFF_NORMED)
     return float(result[0][0])
 
-
 def hex_to_bgr(hex_color):
     """Converte un valore HEX in un array BGR per calcoli OpenCV."""
     hex_color = hex_color.lstrip("#")
@@ -83,7 +141,6 @@ def hex_to_bgr(hex_color):
     g = int(hex_color[2:4], 16)
     b = int(hex_color[4:6], 16)
     return np.array([b, g, r], dtype=np.float32)
-
 
 def extract_roi(frame_bgr, roi):
     """Estrae una regione di interesse da un frame BGR."""
@@ -98,10 +155,14 @@ def extract_roi(frame_bgr, roi):
         raise ValueError(f"ROI vuota: {roi}")
     return cut
 
-
-def mean_color_distance(png_bytes, roi, target_hex):
-    """Calcola la distanza del colore medio della ROI dal colore target."""
-    frame_bgr = png_to_bgr_array(png_bytes)
+def mean_color_distance(image_input, roi, target_hex):
+    """Calcola la distanza del colore medio della ROI dal colore target.
+    
+    Accetta sia byte PNG sia matici NumPy BGR.
+    """
+    # Se è già NumPy usa la RAM direttamente, altrimenti converte i byte PNG
+    frame_bgr = ensure_bgr_array(image_input)
+    
     roi_frame = extract_roi(frame_bgr, roi)
     mean_bgr = roi_frame.mean(axis=(0, 1)).astype(np.float32)
     target_bgr = hex_to_bgr(target_hex)
@@ -123,9 +184,13 @@ def get_pixel_bgr_and_distance(png_bytes, x, y, target_hex):
     return pixel_bgr, distance
 
 
-def roi_green_metrics(png_bytes, roi):
-    """Estrae le metriche cromatiche utili per decidere se la ROI è verde."""
-    frame_bgr = png_to_bgr_array(png_bytes)
+def roi_green_metrics(image_input, roi):
+    """Estrae le metriche cromatiche utili per decidere se la ROI è verde.
+    
+    Accetta sia byte PNG sia array NumPy BGR (in RAM).
+    """
+    # Convertiamo solo se necessario (se è già un array NumPy, passa direttamente)
+    frame_bgr = ensure_bgr_array(image_input)
     roi_frame = extract_roi(frame_bgr, roi).astype(np.float32)
 
     b = roi_frame[:, :, 0]
@@ -138,7 +203,9 @@ def roi_green_metrics(png_bytes, roi):
     dominance = mean_g - max(mean_r, mean_b)
     green_mask = (g >= r + 20) & (g >= b + 20) & (g >= 110)
     green_ratio = float(np.mean(green_mask))
-    distance_to_green, _ = mean_color_distance(png_bytes, roi, model.CONFIG.LEFT_GREEN_TARGET_HEX)
+
+    # Passiamo image_input a mean_color_distance senza rieseguire decodifiche
+    distance_to_green, _ = mean_color_distance(image_input, roi, model.CONFIG.LEFT_GREEN_TARGET_HEX)
 
     return {
         "mean_b": mean_b,
@@ -150,9 +217,12 @@ def roi_green_metrics(png_bytes, roi):
     }
 
 
-def is_roi_green(png_bytes, roi):
-    """Determina se una ROI è considerabile verde sulla base delle metriche calcolate."""
-    metrics = roi_green_metrics(png_bytes, roi)
+def is_roi_green(image_input, roi):
+    """Determina se una ROI è considerabile verde sulla base delle metriche calcolate.
+    
+    Accetta sia byte PNG sia matrici NumPy BGR.
+    """
+    metrics = roi_green_metrics(image_input, roi)
     by_distance = metrics["distance_to_green"] <= model.CONFIG.LEFT_GREEN_DISTANCE_THRESHOLD
     by_dominance = (
         metrics["dominance"] >= model.CONFIG.GREEN_DOMINANCE_MIN

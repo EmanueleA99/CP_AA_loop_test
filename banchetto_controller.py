@@ -86,14 +86,14 @@ def wait_for_device():
     model.start_session_timing()
     model.mark_event("Primo click relay di avvio test")
     pulse_relays()
-    model.second_relay_perf = time.perf_counter()
-    model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
     if getattr(model.CONFIG, "SECOND_RELAY_DELAY_SECONDS", None) is not None:
         model.mark_event(f"Attesa passiva di {model.CONFIG.SECOND_RELAY_DELAY_SECONDS} secondi dopo il primo click relay")
         time.sleep(model.CONFIG.SECOND_RELAY_DELAY_SECONDS)
         model.mark_event("Secondo click relay prima della connessione ADB")
         pulse_relays()
+        model.second_relay_perf = time.perf_counter()
+        model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
     model.mark_event(
         f"Avvio spam di adb connect con timeout locale {model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s e retry immediato per massimo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s"
@@ -132,7 +132,7 @@ def end_of_test_relay_sequence():
 
 
 def wait_for_gray_to_green(serial):
-    """Monitora la ROI finché non passa da grigio a verde."""
+    """Monitora la ROI finché non passa da grigio a verde ad alte prestazioni (10+ FPS)."""
     model.mark_event("Avvio catture schermata e monitoraggio ROI sinistra CarPlay")
     if getattr(model.CONFIG, "START_ANALYSIS_TAP_X", None) is not None:
         model.mark_event(f"Tap singolo di avvio analisi su ({model.CONFIG.START_ANALYSIS_TAP_X}, {model.CONFIG.START_ANALYSIS_TAP_Y})")
@@ -143,16 +143,26 @@ def wait_for_gray_to_green(serial):
     green_elapsed = None
     hard_deadline = time.perf_counter() + model.CONFIG.GREEN_TIMEOUT_SECONDS
 
+    # Imposta la cadenza del loop in base a CONFIG.FPS (es. 10 FPS = 0.1s a frame)
+    target_fps = getattr(model.CONFIG, "FPS", 10)
+    frame_interval = 1.0 / target_fps
+
     while time.perf_counter() <= hard_deadline:
-        png = utils.capture_png(serial)
-        if not png:
-            time.sleep(1 / model.CONFIG.FPS)
+        loop_start = time.perf_counter()
+
+        # 1. Cattura ultra-veloce diretta in RAM (senza codifica PNG su Android)
+        frame_bgr = utils.capture_frame_bgr(serial)
+        if frame_bgr is None:
+            # Se la cattura fallisce, rispetta la cadenza ed esegui il retry
+            elapsed = time.perf_counter() - loop_start
+            time.sleep(max(0.0, frame_interval - elapsed))
             continue
 
-        utils.save_png(png, f"monitor_left_roi_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
-        gray_distance, _ = utils.mean_color_distance(png, model.CONFIG.LEFT_STATUS_ROI, model.CONFIG.LEFT_GRAY_TARGET_HEX)
-        is_green_now, green_metrics = utils.is_roi_green(png, model.CONFIG.LEFT_STATUS_ROI)
+        # 2. Analisi cromatiche in memoria RAM su matrice NumPy
+        gray_distance, _ = utils.mean_color_distance(frame_bgr, model.CONFIG.LEFT_STATUS_ROI, model.CONFIG.LEFT_GRAY_TARGET_HEX)
+        is_green_now, green_metrics = utils.is_roi_green(frame_bgr, model.CONFIG.LEFT_STATUS_ROI)
 
+        # 3. Log a schermo e su file
         msg = (
             f"[T+{model.format_elapsed(model.session_elapsed())}] ROI sinistra frame {idx}: "
             f"dist_grigio={gray_distance:.2f}, "
@@ -164,12 +174,22 @@ def wait_for_gray_to_green(serial):
         print(msg)
         view.safe_log_line(msg)
 
+        # 4. Controllo transizione FASE GRIGIA
         if not gray_seen and gray_distance <= model.CONFIG.LEFT_GRAY_DISTANCE_THRESHOLD:
             gray_seen = True
             model.gray_detect_start_perf = time.perf_counter()
             model.mark_event(f"Rilevato stato grigio nella ROI sinistra (target {model.CONFIG.LEFT_GRAY_TARGET_HEX})")
+            
+            # Salva su disco solo lo screenshot di avvenuta rilevazione del grigio
+            png_bytes = utils.bgr_to_png(frame_bgr)
+            utils.save_png(png_bytes, f"monitor_left_GRAY_frame_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
 
+        # 5. Controllo transizione FASE VERDE (Obiettivo)
         if is_green_now:
+            # Salva su disco lo screenshot dell'obiettivo raggiunto
+            png_bytes = utils.bgr_to_png(frame_bgr)
+            utils.save_png(png_bytes, f"monitor_left_GREEN_frame_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+
             if model.second_relay_perf is not None:
                 model.second_relay_to_green_elapsed = time.perf_counter() - model.second_relay_perf
                 model.mark_event(
@@ -190,11 +210,15 @@ def wait_for_gray_to_green(serial):
             return True, green_elapsed
 
         idx += 1
-        time.sleep(1 / model.CONFIG.FPS)
+
+        # 6. Pacing dinamico del tempo per mantenere l'FPS richiesto
+        elapsed = time.perf_counter() - loop_start
+        sleep_time = frame_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
     model.mark_event(f"Timeout massimo di {model.CONFIG.GREEN_TIMEOUT_SECONDS} secondi senza passaggio al verde")
     return False, green_elapsed
-
 
 def validate_carplay_frames(serial):
     """Verifica la schermata CarPlay e ritorna il risultato e la similarità."""
