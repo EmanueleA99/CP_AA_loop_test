@@ -1,9 +1,46 @@
+import atexit
 import subprocess
 import time
 
 import banchetto_model as model
 import banchetto_view as view
 import banchetto_utils as utils
+
+try:
+    from gpiozero import LED
+except ImportError:
+    # gpiozero non installato: lo segnaliamo solo quando serve davvero pilotare
+    # un relè, con un messaggio chiaro su cosa installare.
+    LED = None
+
+
+# Cache dei pin GPIO già istanziati, per non ricrearli ad ogni pulse_relays()
+_relay_pins = {}
+
+
+def _get_relay(pin):
+    """Ritorna (creandolo se necessario) l'oggetto GPIO che pilota il pin del relè."""
+    if LED is None:
+        raise RuntimeError(
+            "Libreria 'gpiozero' non disponibile. Installa con: "
+            "pip install gpiozero lgpio (dentro il venv)."
+        )
+    if pin not in _relay_pins:
+        _relay_pins[pin] = LED(pin)
+    return _relay_pins[pin]
+
+
+def _release_relays():
+    """Rilascia i pin GPIO occupati dai relè all'uscita dello script."""
+    for relay in _relay_pins.values():
+        try:
+            relay.close()
+        except Exception:
+            pass
+    _relay_pins.clear()
+
+
+atexit.register(_release_relays)
 
 
 def fatal_stop(reason, screenshot_path=None):
@@ -19,23 +56,53 @@ def fatal_stop(reason, screenshot_path=None):
 
 
 def pulse_relays():
-    """Invia un impulso ai relè tramite usbrelay per simulare la pressione del pulsante."""
-    ch1 = model.CONFIG.RELAY_CHANNEL_1
-    ch2 = model.CONFIG.RELAY_CHANNEL_2
+    """Invia un impulso ai relè via GPIO per simulare la pressione del pulsante KL15.
+
+    Il pilotaggio avviene direttamente sui pin GPIO del Raspberry Pi (libreria
+    gpiozero), non più tramite la CLI 'usbrelay': quest'ultima serve solo per
+    relay board USB HID, mentre le board a moduli relè (es. keyestudio) si
+    collegano direttamente ai pin GPIO e vanno pilotate a livello TTL.
+
+    Per cambiare board relè in futuro NON serve toccare questa funzione: basta
+    aggiornare in CONFIG (nel main_banchetto_*.py):
+      - RELAY_CHANNEL_1 / RELAY_CHANNEL_2 -> numero del pin GPIO (numerazione
+        BCM) collegato a ciascun canale relè
+      - RELAY_ACTIVE_LOW -> True se il relè si chiude portando il pin a LOW,
+        False se si chiude portando il pin a HIGH (va verificato empiricamente
+        sul modulo specifico: board diverse hanno polarità diverse)
+      - RELAY_PULSE_HOLD_SECONDS -> durata dell'impulso, come già oggi
+    """
+    pin1 = model.CONFIG.RELAY_CHANNEL_1
+    pin2 = model.CONFIG.RELAY_CHANNEL_2
+    active_low = getattr(model.CONFIG, "RELAY_ACTIVE_LOW", False)
     hold_seconds = getattr(model.CONFIG, "RELAY_PULSE_HOLD_SECONDS", 0.5)
 
     try:
-        subprocess.run(
-            f"usbrelay {ch1}=1 {ch2}=1",
-            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        relay1 = _get_relay(pin1)
+        relay2 = _get_relay(pin2)
+
+        if active_low:
+            relay1.off()
+            relay2.off()
+        else:
+            relay1.on()
+            relay2.on()
+
         time.sleep(hold_seconds)
-        subprocess.run(
-            f"usbrelay {ch1}=0 {ch2}=0",
-            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+
+        if active_low:
+            relay1.on()
+            relay2.on()
+        else:
+            relay1.off()
+            relay2.off()
+
+    except Exception as e:
+        fatal_stop(
+            f"Impossibile pilotare i relè GPIO (pin {pin1}/{pin2}). "
+            f"Controlla i collegamenti, i permessi del gruppo 'gpio' e che "
+            f"gpiozero/lgpio siano installati. Errore: {e}. Arresto definitivo dello script."
         )
-    except subprocess.CalledProcessError:
-        fatal_stop("Impossibile comunicare con usbrelay. Controlla la connessione USB o i permessi udev. Arresto definitivo dello script.")
 
 
 def adb_devices_contains_target():
@@ -86,14 +153,14 @@ def wait_for_device():
     model.start_session_timing()
     model.mark_event("Primo click relay di avvio test")
     pulse_relays()
+    model.second_relay_perf = time.perf_counter()
+    model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
     if getattr(model.CONFIG, "SECOND_RELAY_DELAY_SECONDS", None) is not None:
         model.mark_event(f"Attesa passiva di {model.CONFIG.SECOND_RELAY_DELAY_SECONDS} secondi dopo il primo click relay")
         time.sleep(model.CONFIG.SECOND_RELAY_DELAY_SECONDS)
         model.mark_event("Secondo click relay prima della connessione ADB")
         pulse_relays()
-        model.second_relay_perf = time.perf_counter()
-        model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
     model.mark_event(
         f"Avvio spam di adb connect con timeout locale {model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s e retry immediato per massimo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s"
@@ -132,7 +199,7 @@ def end_of_test_relay_sequence():
 
 
 def wait_for_gray_to_green(serial):
-    """Monitora la ROI finché non passa da grigio a verde ad alte prestazioni (10+ FPS)."""
+    """Monitora la ROI finché non passa da grigio a verde."""
     model.mark_event("Avvio catture schermata e monitoraggio ROI sinistra CarPlay")
     if getattr(model.CONFIG, "START_ANALYSIS_TAP_X", None) is not None:
         model.mark_event(f"Tap singolo di avvio analisi su ({model.CONFIG.START_ANALYSIS_TAP_X}, {model.CONFIG.START_ANALYSIS_TAP_Y})")
@@ -143,26 +210,16 @@ def wait_for_gray_to_green(serial):
     green_elapsed = None
     hard_deadline = time.perf_counter() + model.CONFIG.GREEN_TIMEOUT_SECONDS
 
-    # Imposta la cadenza del loop in base a CONFIG.FPS (es. 10 FPS = 0.1s a frame)
-    target_fps = getattr(model.CONFIG, "FPS", 10)
-    frame_interval = 1.0 / target_fps
-
     while time.perf_counter() <= hard_deadline:
-        loop_start = time.perf_counter()
-
-        # 1. Cattura ultra-veloce diretta in RAM (senza codifica PNG su Android)
-        frame_bgr = utils.capture_frame_bgr(serial)
-        if frame_bgr is None:
-            # Se la cattura fallisce, rispetta la cadenza ed esegui il retry
-            elapsed = time.perf_counter() - loop_start
-            time.sleep(max(0.0, frame_interval - elapsed))
+        png = utils.capture_png(serial)
+        if not png:
+            time.sleep(1 / model.CONFIG.FPS)
             continue
 
-        # 2. Analisi cromatiche in memoria RAM su matrice NumPy
-        gray_distance, _ = utils.mean_color_distance(frame_bgr, model.CONFIG.LEFT_STATUS_ROI, model.CONFIG.LEFT_GRAY_TARGET_HEX)
-        is_green_now, green_metrics = utils.is_roi_green(frame_bgr, model.CONFIG.LEFT_STATUS_ROI)
+        utils.save_png(png, f"monitor_left_roi_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+        gray_distance, _ = utils.mean_color_distance(png, model.CONFIG.LEFT_STATUS_ROI, model.CONFIG.LEFT_GRAY_TARGET_HEX)
+        is_green_now, green_metrics = utils.is_roi_green(png, model.CONFIG.LEFT_STATUS_ROI)
 
-        # 3. Log a schermo e su file
         msg = (
             f"[T+{model.format_elapsed(model.session_elapsed())}] ROI sinistra frame {idx}: "
             f"dist_grigio={gray_distance:.2f}, "
@@ -174,22 +231,12 @@ def wait_for_gray_to_green(serial):
         print(msg)
         view.safe_log_line(msg)
 
-        # 4. Controllo transizione FASE GRIGIA
         if not gray_seen and gray_distance <= model.CONFIG.LEFT_GRAY_DISTANCE_THRESHOLD:
             gray_seen = True
             model.gray_detect_start_perf = time.perf_counter()
             model.mark_event(f"Rilevato stato grigio nella ROI sinistra (target {model.CONFIG.LEFT_GRAY_TARGET_HEX})")
-            
-            # Salva su disco solo lo screenshot di avvenuta rilevazione del grigio
-            png_bytes = utils.bgr_to_png(frame_bgr)
-            utils.save_png(png_bytes, f"monitor_left_GRAY_frame_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
 
-        # 5. Controllo transizione FASE VERDE (Obiettivo)
         if is_green_now:
-            # Salva su disco lo screenshot dell'obiettivo raggiunto
-            png_bytes = utils.bgr_to_png(frame_bgr)
-            utils.save_png(png_bytes, f"monitor_left_GREEN_frame_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
-
             if model.second_relay_perf is not None:
                 model.second_relay_to_green_elapsed = time.perf_counter() - model.second_relay_perf
                 model.mark_event(
@@ -210,15 +257,11 @@ def wait_for_gray_to_green(serial):
             return True, green_elapsed
 
         idx += 1
-
-        # 6. Pacing dinamico del tempo per mantenere l'FPS richiesto
-        elapsed = time.perf_counter() - loop_start
-        sleep_time = frame_interval - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        time.sleep(1 / model.CONFIG.FPS)
 
     model.mark_event(f"Timeout massimo di {model.CONFIG.GREEN_TIMEOUT_SECONDS} secondi senza passaggio al verde")
     return False, green_elapsed
+
 
 def validate_carplay_frames(serial):
     """Verifica la schermata CarPlay e ritorna il risultato e la similarità."""
