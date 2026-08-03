@@ -35,27 +35,19 @@ def pulse_relays():
     active_low = false
     hold_seconds = 0.3
 
-    try:
-
-        if active_low:
+    if active_low:
             relay1.off()
             relay2.off()
-        else:
+    else:
             relay1.on()
             relay2.on()
 
-        time.sleep(hold_seconds)
+    time.sleep(hold_seconds)
 
-        if active_low:
+    if active_low:
             relay1.on()
             relay2.on()
-        else:
+    else:
             relay1.off()
             relay2.off()
-
-    except Exception as e:
-        fatal_stop(
-            f"Impossibile pilotare i relè GPIO (pin {pin1}/{pin2}). "
-            f"Controlla i collegamenti, i permessi del gruppo 'gpio' e che "
-            f"gpiozero/lgpio siano installati. Errore: {e}. Arresto definitivo dello script."
         )
