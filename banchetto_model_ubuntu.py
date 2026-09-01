@@ -13,6 +13,7 @@ second_relay_perf = None
 second_relay_to_green_elapsed = None
  
 import banchetto_view as view
+import banchetto_controller as controller
 
 
 def load_config(config):
@@ -47,44 +48,83 @@ def start_session_timing():
 
 
 def cooldown_restart(seconds=None):
-    """Esegue un countdown prima di ripetere un nuovo test; scrive anche sul log di view."""
+    """Esegue un countdown prima di ripetere un nuovo test e verifica che il banco sia effettivamente spento."""
     if seconds is None:
         seconds = CONFIG.RESTART_DELAY_SECONDS
-    msg = f"Inizio attesa di {seconds} secondi prima del nuovo test..."
-    print(msg)
-    try:
-        view.safe_log_line(msg)
-    except Exception:
-        pass
 
-    remaining = seconds
-    while remaining > 0:
-        should_print = False
+    while True:
+        # 1. Fase di attesa (Countdown)
+        msg = f"Inizio attesa di {seconds} secondi prima del nuovo test..."
+        print(msg)
+        try:
+            view.safe_log_line(msg)
+        except Exception:
+            pass
 
-        if remaining > 60:
-            should_print = (remaining % 20 == 0)
-        elif remaining > 5:
-            should_print = (remaining % 10 == 0)
-        else:
-            should_print = True
+        remaining = seconds
+        while remaining > 0:
+            should_print = False
 
-        if should_print:
-            msg = f"Ripartenza test tra {remaining} secondi..."
+            if remaining > 60:
+                should_print = (remaining % 20 == 0)
+            elif remaining > 5:
+                should_print = (remaining % 10 == 0)
+            else:
+                should_print = True
+
+            if should_print:
+                msg = f"Ripartenza test tra {remaining} secondi..."
+                print(msg)
+                try:
+                    view.safe_log_line(msg)
+                except Exception:
+                    pass
+
+            time.sleep(1)
+            remaining -= 1
+
+        # 2. Check stato banco dopo l'attesa
+        msg = "Attesa terminata - check banco spento."
+        print(msg)
+        try:
+            view.safe_log_line(msg)
+        except Exception:
+            pass
+
+        # Tentativo di connessione ADB
+        ret_code, stdout_text, stderr_text, timed_out = controller.try_adb_connect_once(attempt=1)
+
+        # Se returncode == 0 e lo stdout contiene "connected", il banco è ancora ACCESO
+        stdout_lower = stdout_text.lower()
+        is_alive = (
+            ret_code == 0 
+            and "connected" in stdout_lower 
+            and "failed" not in stdout_lower 
+            and "cannot" not in stdout_lower
+        )
+
+        if is_alive:
+            msg = "Rilevata connessione ADB: il banco è ancora ACCESO! Invochiamo pulse_relays() e ricominciamo l'attesa."
             print(msg)
             try:
                 view.safe_log_line(msg)
             except Exception:
                 pass
 
-        time.sleep(1)
-        remaining -= 1
+            # Invia il comando di spegnimento
+            controller.pulse_relays()
 
-    msg = "Attesa terminata."
-    print(msg)
-    try:
-        view.safe_log_line(msg)
-    except Exception:
-        pass
+            # Il ciclo while ricomincerà da capo l'attesa di `seconds`
+        else:
+            msg = "Check completato: nessuna connessione ADB (banco confermato SPENTO). Procedo con il test."
+            print(msg)
+            try:
+                view.safe_log_line(msg)
+            except Exception:
+                pass
+
+            # Esce dal loop e prosegue con il resto dell'esecuzione
+            break
 
 
 def session_elapsed():
