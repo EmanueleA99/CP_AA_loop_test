@@ -2,16 +2,16 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import banchetto_controller as controller
-import banchetto_model as model
+import banchetto_controller_ubuntu as controller
+import banchetto_model_ubuntu as model
 
 RUN_TIMESTAMP = time.strftime("%d_%m_%y_%H%M")
 
 CONFIG = SimpleNamespace(
     ADB="adb",  # assume adb nel PATH su Ubuntu; usa path assoluto se necessario
     BASE_DIR=Path(__file__).resolve().parent,
-    CARPLAY_REFERENCE_IMAGE=Path(__file__).resolve().parent / "img" / "immagine_carplay.png",
-    DESKTOP_DIR=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep",
+    CARPLAY_REFERENCE_IMAGE=Path(__file__).resolve().parent / "img" / "immagine_android.png",
+    DESKTOP_DIR=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep_AA",
     FPS=5,
     PRECHECK_FRAMES=5,
     CARPLAY_SIMILARITY_THRESHOLD=0.40,
@@ -21,9 +21,9 @@ CONFIG = SimpleNamespace(
     RESTART_DELAY_SECONDS=240,
     GREEN_TIMEOUT_SECONDS=120,
     SECOND_RELAY_DELAY_SECONDS=1,
-    CSV_SUCCESS=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep" / f"log_successi_{RUN_TIMESTAMP}.csv",
-    CSV_FAILURE=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep" / f"log_fallimenti_{RUN_TIMESTAMP}.csv",
-    CSV_OUTPUT_DEEP_SLEEP=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep" / f"results_deepsleep_{RUN_TIMESTAMP}.csv",
+    CSV_SUCCESS=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep_AA" / f"log_successi_AA_{RUN_TIMESTAMP}.csv",
+    CSV_FAILURE=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep_AA" / f"log_fallimenti_AA_{RUN_TIMESTAMP}.csv",
+    CSV_OUTPUT_DEEP_SLEEP=Path(__file__).resolve().parent / "output" / "Test_Deep_Sleep_AA" / f"results_deepsleep_AA_{RUN_TIMESTAMP}.csv",
     RELAY_CHANNEL_1="QAAMZ_1",
     RELAY_CHANNEL_2="QAAMZ_2",
     RELAY_PULSE_HOLD_SECONDS=0.3,
@@ -31,9 +31,9 @@ CONFIG = SimpleNamespace(
     TARGET_IP="172.16.250.248",
     TARGET_PORT="5555",
     TARGET_SERIAL="172.16.250.248:5555",
-    LEFT_STATUS_ROI=(29, 483, 88, 543),
-    LEFT_GRAY_TARGET_HEX="#959ba4",
-    LEFT_GREEN_TARGET_HEX="#60e255",
+    LEFT_STATUS_ROI=(44, 500, 74, 532),
+    LEFT_GRAY_TARGET_HEX="#242424",
+    LEFT_GREEN_TARGET_HEX="#5f876a",
     LEFT_GRAY_DISTANCE_THRESHOLD=45.0,
     LEFT_GREEN_DISTANCE_THRESHOLD=55.0,
     GREEN_DOMINANCE_MIN=25.0,
