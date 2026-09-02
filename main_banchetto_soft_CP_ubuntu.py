@@ -2,8 +2,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import banchetto_controller as controller
-import banchetto_model as model
+import banchetto_controller_ubuntu as controller
+import banchetto_model_ubuntu as model
 
 RUN_TIMESTAMP = time.strftime("%d_%m_%y_%H%M")
 

@@ -12,8 +12,8 @@ relay_start_perf = None
 second_relay_perf = None
 second_relay_to_green_elapsed = None
  
-import banchetto_view as view
-import banchetto_controller as controller
+import banchetto_view_ubuntu as view
+import banchetto_controller_ubuntu as controller
 
 
 def load_config(config):
@@ -91,15 +91,20 @@ def cooldown_restart(seconds=None):
         except Exception:
             pass
 
-        # Tentativo di connessione ADB
-        ret_code, stdout_text, stderr_text, timed_out = controller.try_adb_connect_once(attempt=1)
+        # Tentativo di connessione ADB.
+        # NB: qui il timeout locale (0.5s) NON è ambiguo come nel loop di attesa accensione:
+        # un device realmente spento non risponde affatto al TCP SYN (nessun RST/ICMP),
+        # quindi il timeout locale è proprio il segnale atteso di "banco spento".
+        ret_code, stdout_text, stderr_text, timed_out, _stale = controller.try_adb_connect_once(attempt=1)
 
-        # Se returncode == 0 e lo stdout contiene "connected", il banco è ancora ACCESO
+        # Se non c'è stato timeout, returncode == 0 e lo stdout contiene "connected",
+        # il banco è ancora ACCESO. Un timeout locale equivale a "nessuna risposta" = spento.
         stdout_lower = stdout_text.lower()
         is_alive = (
-            ret_code == 0 
-            and "connected" in stdout_lower 
-            and "failed" not in stdout_lower 
+            not timed_out
+            and ret_code == 0
+            and "connected" in stdout_lower
+            and "failed" not in stdout_lower
             and "cannot" not in stdout_lower
         )
 

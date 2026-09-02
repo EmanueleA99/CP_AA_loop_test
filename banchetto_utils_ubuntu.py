@@ -7,8 +7,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
-import banchetto_model as model
-import banchetto_view as view
+import banchetto_model_ubuntu as model
+import banchetto_view_ubuntu as view
 
 import struct
 

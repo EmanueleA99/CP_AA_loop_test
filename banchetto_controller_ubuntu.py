@@ -1,9 +1,9 @@
 import subprocess
 import time
 
-import banchetto_model as model
-import banchetto_view as view
-import banchetto_utils as utils
+import banchetto_model_ubuntu as model
+import banchetto_view_ubuntu as view
+import banchetto_utils_ubuntu as utils
 
 
 def fatal_stop(reason, screenshot_path=None):
@@ -48,6 +48,31 @@ def adb_devices_contains_target():
     return False
 
 
+def adb_disconnect_target():
+    """Forza la chiusura della entry adb (anche se 'stale'/offline) per il device target.
+
+    Necessario perché adb NON rileva da solo che una connessione TCP precedente
+    e' morta lato device (es. dopo un power-cycle KL15): il server continua a
+    rispondere 'already connected' contro una entry ormai fantasma, e 'adb connect'
+    diventa un no-op finche' non si fa un 'adb disconnect' esplicito.
+    """
+    try:
+        result = subprocess.run(
+            [model.CONFIG.ADB, "disconnect", model.CONFIG.TARGET_SERIAL],
+            capture_output=True,
+            text=True,
+            timeout=model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS
+        )
+        text = (result.stdout.strip() + " " + result.stderr.strip()).strip()
+        if text:
+            print(f"[ADB disconnect] {text}")
+            view.safe_log_line(f"[ADB disconnect] {text}")
+    except subprocess.TimeoutExpired:
+        msg = "[ADB disconnect] timeout locale durante il disconnect forzato"
+        print(msg)
+        view.safe_log_line(msg)
+
+
 def try_adb_connect_once(attempt):
     """Esegue un tentativo di connessione adb al device target."""
     try:
@@ -69,7 +94,11 @@ def try_adb_connect_once(attempt):
             print(f"[ADB connect #{attempt}][stderr] {stderr_text}")
             view.safe_log_line(f"[ADB connect #{attempt}][stderr] {stderr_text}")
 
-        return result.returncode, stdout_text, stderr_text, False
+        # 'already connected' e' un falso positivo se la entry e' in realta' offline/morta
+        # (es. device riavviato dal relay KL15): va trattato come "serve un disconnect", non come successo.
+        stale_already_connected = "already connected" in stdout_text.lower()
+
+        return result.returncode, stdout_text, stderr_text, False, stale_already_connected
 
     except subprocess.TimeoutExpired:
         msg = (
@@ -78,7 +107,32 @@ def try_adb_connect_once(attempt):
         )
         print(msg)
         view.safe_log_line(msg)
-        return None, "", "", True
+        return None, "", "", True, False
+
+
+def wait_for_disconnect(timeout_seconds):
+    """Attende che il device sparisca da 'adb devices', a conferma che il power-cycle KL15 sia avvenuto davvero."""
+    deadline = time.perf_counter() + timeout_seconds
+    was_present = adb_devices_contains_target()
+
+    if not was_present:
+        model.mark_event(
+            "ATTENZIONE: device non risultava connesso nemmeno prima del click relay "
+            "(possibile stato residuo o test precedente non concluso correttamente)"
+        )
+        return "not_present_before"
+
+    while time.perf_counter() < deadline:
+        if not adb_devices_contains_target():
+            model.mark_event("Disconnessione del device confermata dopo il click relay: power-cycle avvenuto")
+            return "disconnected"
+        time.sleep(0.2)
+
+    model.mark_event(
+        f"ATTENZIONE: il device NON è mai sparito da 'adb devices' entro {timeout_seconds}s dal click relay. "
+        f"Sospetto che il relay non abbia effettivamente tolto/ripristinato l'alimentazione KL15 in questo ciclo."
+    )
+    return "never_disconnected"
 
 
 def wait_for_device():
@@ -95,12 +149,25 @@ def wait_for_device():
         model.second_relay_perf = time.perf_counter()
         model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
+        # Verifica esplicita: il device deve sparire dalla rete prima di aspettarne il ritorno.
+        # Se non sparisce mai, il relay non ha davvero fatto il power-cycle e proseguire
+        # sarebbe inutile (si arriverebbe comunque al timeout di GREEN_TIMEOUT_SECONDS a vuoto).
+        disconnect_timeout = getattr(model.CONFIG, "DISCONNECT_CHECK_TIMEOUT_SECONDS", 15)
+        wait_for_disconnect(disconnect_timeout)
+
+    # Pulizia preventiva: se adb aveva ancora una entry (anche offline/morta) per il device,
+    # 'adb connect' successivi risponderebbero solo 'already connected' senza mai rifare
+    # davvero l'handshake. Un disconnect esplicito forza adb a ripartire da zero.
+    adb_disconnect_target()
+
     model.mark_event(
         f"Avvio spam di adb connect con timeout locale {model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s e retry immediato per massimo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s"
     )
 
     deadline = time.perf_counter() + model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS
     attempt = 0
+    consecutive_stale = 0
+    forced_disconnect_rounds = 0
 
     while time.perf_counter() < deadline:
         if adb_devices_contains_target():
@@ -108,7 +175,44 @@ def wait_for_device():
             return model.CONFIG.TARGET_SERIAL
 
         attempt += 1
-        _, _, _, timed_out = try_adb_connect_once(attempt)
+        _, _, _, timed_out, stale_already_connected = try_adb_connect_once(attempt)
+
+        if stale_already_connected:
+            consecutive_stale += 1
+        else:
+            consecutive_stale = 0
+
+        # Se 'adb connect' continua a rispondere 'already connected' senza che il device
+        # risulti mai 'device' in adb devices, la entry e' bloccata/stale: forziamo un
+        # disconnect per rompere lo stallo, invece di spammare connect a vuoto per 120s.
+        if consecutive_stale >= 5:
+            forced_disconnect_rounds += 1
+            model.mark_event(
+                f"Rilevati {consecutive_stale} 'already connected' consecutivi senza stato 'device': "
+                f"forzo un disconnect per rompere la entry adb bloccata (round {forced_disconnect_rounds})"
+            )
+            adb_disconnect_target()
+            consecutive_stale = 0
+            # La rimozione della transport lato server adb dopo 'disconnect' non e' istantanea:
+            # e' asincrona internamente. Senza una piccola pausa, il prossimo 'connect' arriva
+            # spesso troppo presto e trova ancora la vecchia entry, riottenendo 'already connected'
+            # e ripetendo il ciclo inutilmente per diversi secondi.
+            time.sleep(0.5)
+
+            # Se anche dopo alcuni round di disconnect mirato la situazione non si sblocca,
+            # il problema non e' piu' la singola transport ma lo stato interno del server adb
+            # stesso (desync tra cio' che risponde 'connect' e cio' che elenca 'devices').
+            # Un 'disconnect' mirato non basta: serve un reset completo del demone.
+            if forced_disconnect_rounds >= 3:
+                model.mark_event(
+                    f"{forced_disconnect_rounds} round di disconnect mirato non hanno sbloccato la situazione: "
+                    f"eseguo 'adb kill-server' per un reset completo del demone adb"
+                )
+                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                forced_disconnect_rounds = 0
+                # Il prossimo 'adb connect' fara' ripartire da solo il server (start-server
+                # implicito): concediamo un margine un po' piu' ampio prima di ririprovare.
+                time.sleep(1.5)
 
         if adb_devices_contains_target():
             model.mark_event(f"Connessione ADB riuscita al tentativo {attempt}")

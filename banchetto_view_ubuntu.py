@@ -2,7 +2,7 @@ import csv
 import time
 from pathlib import Path
 
-import banchetto_model as model
+import banchetto_model_ubuntu as model
 
 
 def safe_log_line(text):
