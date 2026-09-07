@@ -151,7 +151,7 @@ def mark_event(label):
     msg = f"[T+{format_elapsed(elapsed)}] {label}"
     print(msg)
     try:
-        import banchetto_view as view
+        import banchetto_view_ubuntu as view
         view.safe_log_line(msg)
     except Exception:
         pass

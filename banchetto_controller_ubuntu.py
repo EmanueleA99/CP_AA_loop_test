@@ -4,6 +4,7 @@ import time
 import banchetto_model_ubuntu as model
 import banchetto_view_ubuntu as view
 import banchetto_utils_ubuntu as utils
+import esoTraceLogger_ubuntu as esotrace
 
 
 def fatal_stop(reason, screenshot_path=None):
@@ -138,6 +139,7 @@ def wait_for_disconnect(timeout_seconds):
 def wait_for_device():
     """Avvia la sessione e prova a connettersi al device tramite ADB."""
     model.start_session_timing()
+    esotrace.start_traces()
     model.mark_event("Primo click relay di avvio test")
     pulse_relays()
 
@@ -232,6 +234,7 @@ def end_of_test_relay_sequence():
     """Chiude il test azionando il relay e attivando il cooldown."""
     model.mark_event("Click relay di fine test")
     pulse_relays()
+    esotrace.stop_traces()
     model.cooldown_restart(model.CONFIG.RESTART_DELAY_SECONDS)
 
 
