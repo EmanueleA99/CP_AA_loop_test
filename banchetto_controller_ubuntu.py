@@ -541,6 +541,29 @@ def run_deep_sleep_loop():
             continue
 
 
+def save_soft_final_screenshot(serial, prefix):
+    """Cattura e salva lo screenshot finale di un ciclo Soft Boot, se possibile.
+
+    Analogo a save_failure_final()/save_success_final() del ciclo Deep Sleep, ma
+    senza timeline di durata grigio->verde (non pertinente al Soft Boot). Non
+    alza mai eccezioni: se la cattura fallisce, logga e ritorna None invece di
+    interrompere il ciclo (a differenza del precedente utils.save_png(b"", "")
+    che falliva sempre con IsADirectoryError perche' un filename vuoto risolve
+    alla cartella di sessione stessa, non a un file).
+    """
+    path = None
+    try:
+        png = utils.capture_png(serial)
+        if png:
+            final_name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            path = utils.save_png(png, final_name)
+            model.mark_event(f"Frame finale salvato: {final_name}")
+    except Exception as e:
+        print(f"Errore nel salvataggio screenshot finale: {e}")
+        view.safe_log_line(f"Errore screenshot finale: {e}")
+    return path
+
+
 def run_soft_loop():
     """Esegue il ciclo principale del test Soft Boot."""
     while True:
@@ -557,7 +580,6 @@ def run_soft_loop():
                     f"{model.CONFIG.ADB_CONNECT_SPAM_INTERVAL:.2f} secondi."
                 )
                 print(reason)
-                utils.save_png(b"", "")
                 view.append_output_csv("FAILED", reason)
                 subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
                 end_of_test_relay_sequence()
@@ -571,7 +593,7 @@ def run_soft_loop():
                     f"La ROI sinistra {model.CONFIG.LEFT_STATUS_ROI} non è passata da grigio a verde entro {model.CONFIG.GREEN_TIMEOUT_SECONDS} secondi."
                 )
                 print(reason)
-                utils.save_png(b"", "")
+                save_soft_final_screenshot(serial, "FINAL_FAIL")
                 view.append_output_csv("FAILED", reason)
                 subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
                 end_of_test_relay_sequence()
@@ -593,7 +615,7 @@ def run_soft_loop():
                 time.sleep(model.CONFIG.PARTIAL_FAIL_WAIT_SECONDS)
                 model.mark_event(f"Attesa correttiva di {model.CONFIG.PARTIAL_FAIL_WAIT_SECONDS} secondi completata")
 
-                utils.save_png(b"", "")
+                save_soft_final_screenshot(serial, "FINAL_FAIL")
                 view.append_output_csv("PARTIALLY FAILED", partial_reason)
                 subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
                 end_of_test_relay_sequence()
@@ -609,7 +631,7 @@ def run_soft_loop():
                 success_reason += " L'analisi è stata completata sullo screen FINAL perché i 5 frame iniziali non hanno superato la soglia di similarità."
 
             print(success_reason)
-            utils.save_png(b"", "")
+            save_soft_final_screenshot(serial, "FINAL_OK")
             view.append_output_csv("PASSED", success_reason)
 
             subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
