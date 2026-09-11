@@ -1,323 +1,342 @@
-# Banchetto Test CarPlay / Android Auto — Ubuntu
+# CP/AA HIL Test Bench — Ubuntu branch
 
-Script per l'automazione del banco di test hardware-in-the-loop che verifica il risveglio e
-l'avvio di Apple CarPlay / Android Auto su un infotainment (ICC), simulando la pressione del
-pulsante KL15 tramite una scheda relè USB e monitorando lo schermo via ADB.
+Hardware-in-the-loop automation for a physical automotive infotainment unit (IVI). The bench
+simulates KL15 button presses via a relay board, connects to the IVI over ADB (TCP/IP), and
+monitors the screen to detect Apple CarPlay / Android Auto startup, covering two scenarios:
 
-Il banco copre due scenari:
+- **Deep Sleep** (`main_banchetto_deep_sleep_CP_ubuntu.py`, `main_banchetto_deep_sleep_AA_ubuntu.py`):
+  the IVI starts powered off / in deep sleep. Two relay pulses are sent (power-on enabler, then
+  the actual KL15 pulse), and the script waits for the ADB connection to drop and come back
+  before checking the status icon and the final CarPlay/AA screen.
+- **Soft Boot** (`main_banchetto_soft_CP_ubuntu.py`, `main_banchetto_soft_sleep_AA_ubuntu.py`):
+  the IVI is already on. A single relay pulse simulates the KL15 press, then the same
+  gray→green icon check and final screen validation run.
 
-- **Deep Sleep** (`main_banchetto_deep_sleep_cp.py`): il device parte da spento/deep sleep,
-  richiede due impulsi relè in sequenza (accensione + KL15) e verifica sia il passaggio
-  dell'icona di stato CarPlay da grigia a verde, sia che la sessione CarPlay sia effettivamente
-  in foreground a schermo intero.
-- **Soft Boot** (`main_banchetto_soft_cp.py` per CarPlay, `main_banchetto_soft_sleep_aa.py` per
-  Android Auto): il device è già acceso, si simula solo il pulsante KL15 (un impulso singolo) e
-  si verifica lo stesso passaggio grigio→verde + foreground.
+This README covers the **`ubuntu` branch only**. On this branch the relay board is a generic
+USB-HID relay compatible with the `usbrelay` CLI, driven over USB regardless of the host
+machine. The `main` branch differs mainly in that it targets a Raspberry Pi driving the relay
+directly via its GPIO pins (`gpiozero`) instead of a USB relay board — it's being reworked
+separately and is out of scope here.
 
 ---
 
-## 1. Architettura del codice
+## 1. Code architecture
 
-Il progetto segue una struttura MVC leggera, con stato e configurazione condivisi tramite un
-modulo globale:
+Lightweight MVC, with shared state/config held in `banchetto_model_ubuntu`:
 
-| File | Ruolo |
+| File | Role |
 |---|---|
-| `banchetto_model.py` | Stato di sessione: `CONFIG` (parametri di test), timer (`session_start_perf`, `gray_detect_start_perf`, `second_relay_perf`...), timeline degli eventi (`mark_event`) |
-| `banchetto_view.py` | Tutto l'I/O di log e reportistica: log testuale di sessione, CSV di risultato (`append_csv`, `append_output_csv`, `append_deep_sleep_csv`) |
-| `banchetto_utils.py` | Azioni fisiche: cattura schermo via ADB (`capture_png`, `capture_frame_bgr`), analisi colore con OpenCV, tap/swipe/motionevent via `adb shell input`, impulsi relè via `usbrelay` |
-| `banchetto_controller.py` | Logica del test: connessione ADB, attesa grigio→verde, validazione schermata CarPlay/AA, i due loop principali (`run_deep_sleep_loop`, `run_soft_loop`) |
-| `main_banchetto_*.py` | Entry point: definiscono il `CONFIG` specifico del test (soglie, coordinate, path) e lanciano il loop corrispondente |
+| `banchetto_model_ubuntu.py` | `CONFIG` holder, session timers (`session_start_perf`, `gray_detect_start_perf`, `second_relay_perf`...), event timeline (`mark_event`), `cooldown_restart()` (waits between cycles **and** actively verifies the IVI is powered off before starting the next one) |
+| `banchetto_view_ubuntu.py` | All logging/reporting I/O: per-session text log, result CSVs (`append_csv`, `append_output_csv`, `append_deep_sleep_csv`) |
+| `banchetto_utils_ubuntu.py` | Physical actions: ADB screen capture (`capture_png`, `capture_frame_bgr`), OpenCV colour analysis, tap/swipe/motionevent via `adb shell input`, relay pulses via `usbrelay` |
+| `banchetto_controller_ubuntu.py` | Test logic: ADB connect/disconnect handling, gray→green wait loop, CarPlay/AA screen validation, the two main loops (`run_deep_sleep_loop`, `run_soft_loop`) |
+| `esoTraceLogger_ubuntu.py` | Starts/stops esoTrace (jTraceCapture) acquisitions for the SYS, IVI and ConMod partitions, one per test cycle |
+| `main_banchetto_*_ubuntu.py` | Entry points: define the test-specific `CONFIG` (thresholds, coordinates, paths) and launch the matching loop |
 
-Ogni `main_*.py` è indipendente e lanciabile singolarmente: `python main_banchetto_deep_sleep_cp.py`.
+Each `main_*.py` is independent and can be run on its own, e.g. `python main_banchetto_deep_sleep_CP_ubuntu.py`.
+
+All four main scripts share the exact same `wait_for_device()` / `end_of_test_relay_sequence()`
+functions in the controller, which is also where esoTrace is hooked in (see [§5](#5-esotrace-integration)) —
+so trace capture is automatic for every cycle of every script, with no per-script wiring needed.
 
 ---
 
-## 2. Requisiti di sistema (installazione da zero su un nuovo Ubuntu)
+## 2. System requirements (fresh Ubuntu / Raspberry Pi setup)
 
-### 2.1 Python e dipendenze
+### 2.1 Python and dependencies
 
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip
 
-cd /path/al/progetto
+cd /path/to/project
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` installa `opencv-python-headless`, `numpy` e `Pillow` — nessuna libreria
-Python è necessaria per il relè (gestito dal comando `usbrelay`, non da una libreria HID Python).
-
-Ricordati di attivare il venv (`source venv/bin/activate`) in ogni nuova sessione di terminale
-prima di lanciare uno script.
+`requirements.txt` installs `opencv-python-headless`, `numpy` and `Pillow`. Remember to
+activate the venv (`source venv/bin/activate`) in every new terminal session before running a
+script.
 
 ### 2.2 ADB (Android Debug Bridge)
 
 ```bash
 sudo apt install -y android-tools-adb
-```
-
-Verifica che sia raggiungibile semplicemente con:
-
-```bash
 adb version
 which adb
 ```
 
-Se il comando non è nel `PATH`, aggiorna il campo `ADB=` in ciascun `main_*.py` con il percorso
-assoluto dell'eseguibile.
+If `adb` is not on the `PATH`, update `ADB=` in each `main_*.py` with the absolute path to the
+executable.
 
-### 2.3 usbrelay (pilotaggio della scheda relè)
+### 2.3 usbrelay (relay board)
+
+This branch drives the relay via a generic **USB-HID relay board**, controlled through the
+`usbrelay` CLI — this is what lets the bench run on plain Ubuntu (or a Raspberry Pi running
+Ubuntu desktop) without depending on GPIO pins. The `main` branch instead targets a relay board
+wired directly to a Raspberry Pi's GPIO header, driven via `gpiozero`; the two are not
+interchangeable without also swapping `pulse_relays()` in `banchetto_controller_ubuntu.py`.
 
 ```bash
 sudo apt install -y usbrelay
+usbrelay   # lists all connected relay boards and their channel states
 ```
 
-`usbrelay`, lanciato senza argomenti, elenca tutte le schede relè collegate e il loro stato:
+If this errors out on permissions, a udev rule is needed for the HID device (vendor `16c0`,
+product `05df`):
 
 ```bash
-usbrelay
+sudo tee /etc/udev/rules.d/99-usbrelay.rules <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="05df", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="0666"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
-Se il comando dà errore di permessi (o richiede `sudo`), serve una regola udev che assegni i
-permessi corretti al dispositivo HID. Vedi la sezione [4.2](#42-cambiare-la-scheda-relè) più
-sotto per i dettagli su come crearla e su come trovare l'identificativo esatto della tua scheda.
+### 2.4 esoTrace prerequisites (SYS / IVI / ConMod logging)
 
-### 2.4 Verifica finale
-
-Con il banco collegato (relè via USB, infotainment raggiungibile in rete):
+esoTrace acquisitions run as `jtracecapture.jar` inside dedicated `lxterminal` windows, one per
+partition. This needs:
 
 ```bash
-usbrelay                         # deve elencare la scheda senza errori
-adb connect 172.16.250.248:5555  # deve confermare la connessione
-adb devices                      # il device deve apparire come "172.16.250.248:5555   device"
+sudo apt install -y default-jdk lxterminal wmctrl
 ```
 
-Se tutto risponde correttamente, il banco è pronto per eseguire i test.
+- **`default-jdk`**: provides `java`, used to run `jtracecapture.jar`.
+- **`lxterminal`**: opens one visible terminal window per partition (SYS/IVI/ConMod). This
+  **requires a graphical/X session** on the machine running the bench — it will not work over a
+  plain headless SSH session without a desktop environment. If your bench runs headless, let me
+  know and the module can be adapted to run the java processes in the background instead of in
+  terminal windows (same start/stop behaviour, no visible windows).
+- **`wmctrl`**: used to close the SYS/IVI/ConMod terminal windows when a cycle ends. Not
+  strictly required — if missing, the underlying `java` processes are still killed (via `pkill`),
+  only the empty terminal windows are left open.
+- **`jtracecapture.jar`** itself must be placed in the `jtrace/` folder at the project root
+  (already present in this checkout). It is *not* pulled by `requirements.txt` — it's a
+  standalone tool copied in manually.
+
+If any of `java`, the jar, or `lxterminal` is missing, `esoTraceLogger_ubuntu.py` logs a clear
+warning and **skips tracing for that cycle without stopping the test** — a missing esoTrace
+prerequisite never blocks the bench.
+
+### 2.5 Final check
+
+With the bench wired up (relay via USB, IVI reachable on the network):
+
+```bash
+usbrelay                         # must list the board with no errors
+adb connect 172.16.250.248:5555  # must confirm the connection
+adb devices                      # device must show as "172.16.250.248:5555   device"
+java -version                    # must print a JDK/JRE version
+ls jtrace/jtracecapture.jar      # must exist
+```
 
 ---
 
-## 3. Come lanciare i test
+## 3. Running the tests
 
 ```bash
 source venv/bin/activate
 
-python main_banchetto_deep_sleep_cp.py     # test Deep Sleep + CarPlay
-python main_banchetto_soft_cp.py           # test Soft Boot + CarPlay
-python main_banchetto_soft_sleep_aa.py     # test Soft Boot + Android Auto
+python main_banchetto_deep_sleep_CP_ubuntu.py    # Deep Sleep + CarPlay
+python main_banchetto_deep_sleep_AA_ubuntu.py    # Deep Sleep + Android Auto
+python main_banchetto_soft_CP_ubuntu.py          # Soft Boot + CarPlay
+python main_banchetto_soft_sleep_AA_ubuntu.py    # Soft Boot + Android Auto
 ```
 
-Ogni script esegue un **loop infinito**: al termine di ogni ciclo (PASSED/FAILED/PARTIALLY
-FAILED) attende `RESTART_DELAY_SECONDS`, poi ricomincia automaticamente. Si interrompe con
-`Ctrl+C`.
+Each script runs an **infinite loop**: at the end of every cycle (PASSED/FAILED/PARTIALLY
+FAILED) it waits `RESTART_DELAY_SECONDS`, actively checks that the IVI is really powered off
+before continuing (see `cooldown_restart()` in `banchetto_model_ubuntu.py`), then starts the
+next cycle automatically. Stop with `Ctrl+C`.
 
-### Struttura dell'output
+### Output structure
 
-Ogni lancio dello script crea/aggiorna, dentro `output/<Nome_Test>/`:
+Every launch creates/updates, inside `output/<Test_Name>/`:
 
-- una cartella `cattura schermate_<timestamp>/` per ogni ciclo di test, contenente gli
-  screenshot salvati durante quel ciclo (fase grigia, fase verde, controllo finale CarPlay,
-  eventuale frame di fallimento) e il log testuale `tempo_connessione.txt` di quel ciclo;
-- uno o più CSV con **timestamp di lancio dello script** nel nome (es.
-  `results_deepsleep_30_07_26_1547.csv`), che accumulano una riga per ogni ciclo eseguito in
-  quella sessione. Un nuovo lancio dello script crea sempre un CSV nuovo, non sovrascrive né
-  accoda a uno vecchio.
+- one `cattura schermate_<timestamp>/` folder **per test cycle**, containing:
+  - the screenshots captured during that cycle (gray phase, green phase, final CarPlay/AA
+    check frames, any failure frame),
+  - the per-cycle text log `tempo_connessione.txt`,
+  - **the three esoTrace files for that cycle** (`traceSYS.esotrace_...`,
+    `traceIVI.esotrace_...`, `traceConMod.esotrace_...`) — see [§5](#5-esotrace-integration).
+- one or more CSVs named with the **script launch timestamp** (e.g.
+  `results_deepsleep_30_07_26_1547.csv`), accumulating one row per cycle run in that session. A
+  new launch always creates a new CSV rather than overwriting or appending to an old one.
 
-**CSV del test Deep Sleep** (`results_deepsleep_*.csv`), quattro colonne:
+**Deep Sleep CSV** (`results_deepsleep_*.csv` / `results_deepsleep_AA_*.csv`), four columns:
 
-| Colonna | Significato |
+| Column | Meaning |
 |---|---|
-| Timestamp evento | Data/ora della riga |
-| Stato test | `PASSED` (verde + CarPlay in foreground) / `PARTIALLY PASSED` (verde ok, CarPlay non in foreground) / `FAILED` (icona mai diventata verde) |
-| Last Mode | `PASSED`/`FAILED` in base a CarPlay in foreground o background, `N/A` se il test non ha mai raggiunto il verde |
-| Connection time | Secondi trascorsi dal click relay al passaggio al verde, o `N/A` |
+| Timestamp evento | Row date/time |
+| Stato test | `PASSED` (green + CarPlay/AA in foreground) / `PARTIALLY PASSED` (green ok, not in foreground) / `FAILED` (icon never turned green) |
+| Last Mode | `PASSED`/`FAILED` depending on foreground/background, `N/A` if green was never reached |
+| Connection time | Seconds from the KL15 relay click to the green transition, or `N/A` |
 
-**CSV dei test Soft Boot** (`results_carplay_*.csv` / `results_androidauto_*.csv`): tre colonne
-`timestamp`, `status` (`PASSED`/`PARTIALLY FAILED`/`FAILED`), `reason` (descrizione testuale).
+**Soft Boot CSVs** (`results_carplay_*.csv` / `results_androidauto_*.csv`): three columns
+`timestamp`, `status` (`PASSED`/`PARTIALLY FAILED`/`FAILED`), `reason` (free-text description).
 
 ---
 
-## 4. Guida alla configurazione
+## 4. Configuration guide — `CONFIG` parameters
 
-Tutti i parametri di test si trovano nel blocco `CONFIG = SimpleNamespace(...)` in cima a
-ciascun `main_banchetto_*.py`. Le sezioni seguenti spiegano come recuperare i valori corretti
-quando cambi banco, scheda relè o infotainment.
+All test parameters live in the `CONFIG = SimpleNamespace(...)` block at the top of each
+`main_banchetto_*_ubuntu.py`. The four scripts share the same parameter *names*; only the
+values differ (ROI coordinates, colour targets, output folders, timings). This section explains
+what each group of parameters actually controls, using `main_banchetto_deep_sleep_CP_ubuntu.py`
+and `main_banchetto_deep_sleep_AA_ubuntu.py` as the reference (Soft Boot scripts use the same
+fields minus the deep-sleep-only ones, see [§4.6](#46-fields-only-present-in-soft-boot-scripts)).
 
-### 4.1 Cambiare il display da catturare (`SCREEN_DISPLAY_ID`)
+### 4.1 ADB / network connection
 
-Gli infotainment automotive spesso espongono **più display fisici** (cluster, HMI centrale,
-pannelli secondari). Se non specifichi quale catturare, `screencap` stampa un avviso
-(`[Warning] Multiple displays were found...`) **direttamente nei byte dell'immagine**,
-corrompendola — lo screenshot risulterà vuoto o non riconosciuto come PNG valido.
-
-**Attenzione**: l'ID che serve a `screencap -d` è l'**ID fisico** del display (un numero lungo,
-tipo `4633128631561747456`), **non** l'ID logico Android (0, 1, 2...) che si vede in
-`dumpsys display`. Sono due numerazioni diverse e usare quella sbagliata produce cattura vuota
-o silenziosamente errata, senza un messaggio d'errore chiaro.
-
-**Procedura per trovare l'ID fisico corretto**, con il device connesso via ADB:
-
-1. Elenca i display disponibili con relativa risoluzione:
-
-   ```bash
-   adb -s <ip>:<porta> shell dumpsys display | grep -E "mDisplayId=|width=|height="
-   ```
-
-   Nota le risoluzioni di ciascun display (es. `1920 x 816`) e il campo `uniqueId="local:XXXX"`
-   di ciascuno: il numero dopo `local:` è quasi sempre l'ID fisico che ti serve.
-
-2. Identifica quale display corrisponde al pannello che il test deve monitorare (di solito
-   quello la cui risoluzione combacia con le coordinate ROI/tap già presenti nel `CONFIG`, o
-   quello con la risoluzione più simile allo schermo HMI principale).
-
-3. Testa la cattura con quell'ID:
-
-   ```bash
-   adb -s <ip>:<porta> exec-out screencap -d <ID_fisico> -p > /tmp/test.png
-   file /tmp/test.png
-   ```
-
-   Deve rispondere `PNG image data, <larghezza> x <altezza>, ...`. Se dice `data` o `empty`,
-   l'ID non è quello giusto — riprova con un altro valore `uniqueId` dall'elenco del punto 1.
-   In alternativa, `dumpsys SurfaceFlinger --display-id` elenca gli stessi ID fisici in un
-   formato diverso, utile come controllo incrociato.
-
-4. Apri `/tmp/test.png` e verifica **visivamente** che sia davvero il pannello con l'icona
-   CarPlay/Android Auto da monitorare (due display diversi possono avere la stessa risoluzione
-   per coincidenza).
-
-5. Una volta confermato, aggiorna in **tutti e tre** i `main_banchetto_*.py`:
-
-   ```python
-   SCREEN_DISPLAY_ID=<ID_fisico_confermato>,
-   ```
-
-L'ID fisico di un pannello è stabile nel tempo (deriva dall'hardware del display, non cambia
-al riavvio), quindi va aggiornato solo se cambi banco/infotainment fisico.
-
-### 4.2 Cambiare la scheda relè
-
-I canali relè sono identificati da un nome tipo `QAAMZ_1` / `QAAMZ_2` (formato
-`<serial_scheda>_<numero_canale>`), usato da `usbrelay` per indirizzare il comando al relè
-giusto (rilevante se hai più schede collegate).
-
-**Procedura per trovare gli identificativi della nuova scheda:**
-
-1. Collega la scheda relè via USB.
-
-2. Verifica che il sistema la veda a livello USB (le schede relè HID comuni usano il vendor ID
-   `16c0` e product ID `05df`):
-
-   ```bash
-   lsusb | grep -i "16c0:05df"
-   ```
-
-3. Elenca i canali disponibili con `usbrelay` (senza argomenti): stampa una riga per ogni relè
-   rilevato, nel formato `<SERIAL>_<NUMERO>=<STATO>` (0 = aperto, 1 = chiuso):
-
-   ```bash
-   usbrelay
-   ```
-
-   Esempio di output:
-   ```
-   QAAMZ_1=0
-   QAAMZ_2=0
-   ```
-
-   Il prefisso prima del `_` (qui `QAAMZ`) è il serial univoco di quella scheda — cambia da
-   scheda a scheda.
-
-4. Se il comando dà errore di permessi, serve una regola udev. Crea
-   `/etc/udev/rules.d/99-usbrelay.rules` con:
-
-   ```
-   SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="05df", MODE="0666"
-   KERNEL=="hidraw*", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="0666"
-   ```
-
-   poi ricarica le regole e riconnetti la scheda:
-
-   ```bash
-   sudo udevadm control --reload-rules
-   sudo udevadm trigger
-   ```
-
-5. Verifica di poter azionare un canale manualmente:
-
-   ```bash
-   usbrelay QAAMZ_1=1   # chiude il relè 1
-   usbrelay QAAMZ_1=0   # lo riapre
-   ```
-
-6. Aggiorna in tutti i `main_banchetto_*.py` i due canali usati per simulare la pressione del
-   pulsante:
-
-   ```python
-   RELAY_CHANNEL_1="<SERIAL>_1",
-   RELAY_CHANNEL_2="<SERIAL>_2",
-   ```
-
-Se la nuova scheda ha un solo canale, o serve pilotarne solo uno, si può modificare
-`pulse_relays()` in `banchetto_controller.py` per usare un solo canale, oppure impostare
-entrambe le costanti allo stesso valore.
-
-### 4.3 Cambiare infotainment/IP di rete
-
-```python
-TARGET_IP="<nuovo IP>",
-TARGET_PORT="5555",
-TARGET_SERIAL="<nuovo IP>:5555",   # deve includere sempre la porta
-```
-
-**Importante**: `TARGET_SERIAL` deve sempre includere la porta (`:5555`). Un serial senza porta
-non corrisponde esattamente al device registrato da `adb connect`, e i comandi ADB successivi
-(`-s <serial>`) possono restare in attesa indefinita di un device che non trovano — uno dei
-problemi più insidiosi da diagnosticare, perché ADB spesso non riporta un errore immediato.
-
-### 4.4 Altri parametri principali
-
-| Parametro | Significato |
+| Parameter | Effect |
 |---|---|
-| `LEFT_STATUS_ROI` | Coordinate `(x1, y1, x2, y2)` della regione di schermo dove si trova l'icona di stato CarPlay/AA da monitorare |
-| `LEFT_GRAY_TARGET_HEX` / `LEFT_GREEN_TARGET_HEX` | Colori di riferimento (grigio = in attesa, verde/azzurro = connesso) |
-| `LEFT_GRAY_DISTANCE_THRESHOLD` / `LEFT_GREEN_DISTANCE_THRESHOLD` | Soglie di tolleranza colore per considerare la ROI "grigia" o "verde" |
-| `GREEN_DOMINANCE_MIN` / `GREEN_PIXELS_MIN_RATIO` | Criterio alternativo (dominanza del canale verde) per rilevare il verde, usato in OR con la soglia di distanza |
-| `CARPLAY_REFERENCE_IMAGE` | Immagine di riferimento (`img/immagine_carplay.png` o `img/immagine_android.png`) usata per il template matching della schermata finale |
-| `CARPLAY_SIMILARITY_THRESHOLD` | Soglia minima di similarità per considerare la schermata finale CarPlay/AA valida |
-| `FPS` | Frequenza di campionamento durante l'attesa grigio→verde |
-| `GREEN_TIMEOUT_SECONDS` | Timeout massimo di attesa del passaggio al verde prima di dichiarare fallito il ciclo |
-| `RESTART_DELAY_SECONDS` | Attesa tra un ciclo di test e il successivo |
-| `SECOND_RELAY_DELAY_SECONDS` | (solo deep sleep) Attesa tra il primo impulso relè (enabler/accensione) e il secondo (che avvia effettivamente lo startup se il sistema è in deep sleep — vedi [nota di progettazione](#5-note-di-progettazione)) |
-| `ADB_COMMAND_TIMEOUT_SECONDS` | Timeout per ogni singolo comando ADB (default 10s se non specificato); evita che uno screencap/tap bloccato congeli lo script |
+| `ADB` | Path to the `adb` executable. `"adb"` assumes it's on the `PATH`; use an absolute path otherwise. |
+| `TARGET_IP` | IP address of the IVI on the bench network. |
+| `TARGET_PORT` | ADB TCP port on the IVI, normally `"5555"`. |
+| `TARGET_SERIAL` | **Must always be `"<TARGET_IP>:<TARGET_PORT>"`.** All ADB calls use this as the `-s` device identifier; a serial without the port won't match the device registered by `adb connect`, and later commands can hang waiting for a device that "isn't found" — one of the least obvious failure modes to diagnose, since ADB often doesn't report an immediate, clear error. |
+| `ADB_CONNECT_TIMEOUT_SECONDS` | Overall time budget for reconnecting after the relay pulses, before the cycle is declared FAILED (`Device ADB ... non disponibile`). |
+| `ADB_SINGLE_CONNECT_TIMEOUT_SECONDS` | Local timeout for *each individual* `adb connect` attempt during that budget (the loop retries immediately on timeout). |
+| `ADB_CONNECT_SPAM_INTERVAL` | Pause between successive `adb connect` retries when a single attempt does *not* time out (`0.0` in the deep sleep scripts = retry back-to-back; `0.10` in the soft scripts). |
+| `DISCONNECT_CHECK_TIMEOUT_SECONDS` | *(optional, not set explicitly in these scripts — defaults to 15s)* How long to wait, after the second relay pulse, for the device to actually disappear from `adb devices` before starting to reconnect. This confirms the KL15 power-cycle genuinely happened rather than proceeding straight to a reconnect attempt that would just time out later. |
+| `ADB_COMMAND_TIMEOUT_SECONDS` | *(optional, defaults to 10s)* Timeout applied to every individual ADB command (screencap, tap, swipe...), so a stuck command can't freeze the whole script. |
+
+The controller also automatically detects and recovers from **stale "already connected" ADB
+transports** (a known issue after KL15 power-cycles, where `adb` keeps reporting a dead
+connection as alive) — this logic (`adb_disconnect_target`, consecutive-stale detection,
+escalation to `adb kill-server`) is not itself configurable; it kicks in automatically inside
+`wait_for_device()`.
+
+### 4.2 Relay / KL15 simulation
+
+| Parameter | Effect |
+|---|---|
+| `RELAY_CHANNEL_1` / `RELAY_CHANNEL_2` | Channel names as reported by `usbrelay` (format `<board_serial>_<channel_number>`, e.g. `QAAMZ_1`). Both are pulsed together to simulate one button press. |
+| `RELAY_PULSE_HOLD_SECONDS` | How long the relay stays closed (button "held down") before opening again. |
+| `SECOND_RELAY_DELAY_SECONDS` | **Deep sleep only.** Delay between the *first* relay pulse (power-on enabler) and the *second* (the pulse that actually starts the boot sequence if the IVI is in deep sleep). See the design note in [§6](#6-design-notes) on why the connection timer starts from the second pulse, not the first. |
+
+### 4.3 Screen capture / display
+
+| Parameter | Effect |
+|---|---|
+| `SCREEN_DISPLAY_ID` | **Physical** display ID passed to `screencap -d` (not the logical Android display ID from `dumpsys display`). Needed whenever the IVI exposes more than one physical panel — without it, `screencap` can prepend a warning string to the PNG bytes and corrupt every screenshot. Stable per piece of hardware; only needs changing if you swap to a different bench/IVI unit. |
+| `FPS` | Sampling rate for the gray→green monitoring loop (`5` in the deep sleep scripts, `2` in the soft scripts) and for the pacing between the `PRECHECK_FRAMES` final-check captures. Higher = more responsive detection, more ADB/CPU load. |
+| `PRECHECK_FRAMES` | Number of consecutive frames averaged when validating the final CarPlay/AA screen against the reference image. |
+
+### 4.4 Colour / icon detection (gray→green transition)
+
+| Parameter | Effect |
+|---|---|
+| `LEFT_STATUS_ROI` | `(x1, y1, x2, y2)` region of the screen where the CarPlay/AA status icon is monitored. Differs between the CP and AA scripts because the icon sits in a slightly different spot/size on each screen. |
+| `LEFT_GRAY_TARGET_HEX` | Reference colour for the "waiting" state. |
+| `LEFT_GREEN_TARGET_HEX` | Reference colour for the "connected" state — despite the name this is CarPlay's green (`#60e255`) in the CP script and Android Auto's blue (`#15a2e7`) in the AA scripts; the variable name is shared but the meaning ("target/connected colour") is the same. |
+| `LEFT_GRAY_DISTANCE_THRESHOLD` / `LEFT_GREEN_DISTANCE_THRESHOLD` | Maximum Euclidean colour distance (in BGR space) from the reference colour for the ROI to count as "gray" / "green". |
+| `GREEN_DOMINANCE_MIN` / `GREEN_PIXELS_MIN_RATIO` | Alternative green-detection rule, OR'd with the distance threshold: the green channel must dominate red/blue by at least `GREEN_DOMINANCE_MIN`, over at least `GREEN_PIXELS_MIN_RATIO` of the ROI's pixels. Useful when the exact colour drifts slightly but is still clearly green. |
+| `GREEN_TIMEOUT_SECONDS` | Hard timeout for the gray→green wait loop; if exceeded, the cycle is declared FAILED (and, for deep sleep, the no-green recovery gesture in §4.5 is attempted). |
+
+### 4.5 Final-screen validation and failure recovery (deep sleep)
+
+| Parameter | Effect |
+|---|---|
+| `CARPLAY_REFERENCE_IMAGE` | Reference image used for template matching against the final screen (`img/immagine_carplay.png` for CP, `img/immagine_android.png` for AA). |
+| `CARPLAY_SIMILARITY_THRESHOLD` | Minimum average similarity (over `PRECHECK_FRAMES`) for the final screen to count as a valid CarPlay/AA foreground screen. |
+| `FINAL_FAIL_TAP_X` / `FINAL_FAIL_TAP_Y` | Coordinates tapped as a recovery/dismiss action when the final screen check fails (icon went green, but the foreground app isn't CarPlay/AA). |
+| `FINAL_FAIL_PIXEL_X` / `FINAL_FAIL_PIXEL_Y` / `FINAL_FAIL_PIXEL_TARGET_HEX` / `FINAL_FAIL_PIXEL_DISTANCE_THRESHOLD` | Single-pixel check used to decide whether the **"no-green" special recovery gesture** applies (see below): if this pixel on the failure screenshot is close enough to the target colour, the gesture is attempted. |
+| `FINAL_FAIL_RECOVERY_TAP_X` / `FINAL_FAIL_RECOVERY_TAP_Y` | Tap coordinates for that recovery, sent before the hold+swipe gesture below. |
+| `SPECIAL_HOLD_START_X` / `SPECIAL_HOLD_START_Y` | Starting point for the special recovery gesture (a touch-and-hold). |
+| `SPECIAL_SWIPE_END_X` / `SPECIAL_SWIPE_END_Y` | End point the hold is dragged to. |
+| `SPECIAL_HOLD_BEFORE_SWIPE_MS` | How long the touch is held at the start point before the drag begins. |
+| `SPECIAL_TOTAL_SWIPE_MS` | *(present in CONFIG; currently informational — the actual drag in `special_hold_and_swipe()` is driven by discrete DOWN/MOVE/UP `motionevent` calls, not a timed `swipe` command)* |
+
+This whole block only fires when the icon never turns green within `GREEN_TIMEOUT_SECONDS`
+(`maybe_execute_no_green_final_recovery` in `banchetto_utils_ubuntu.py`): it's a best-effort
+attempt to unstick the IVI (e.g. dismiss a stuck dialog) before the cycle ends and the relay
+powers everything off for the next attempt.
+
+### 4.6 Fields only present in Soft Boot scripts
+
+The Soft Boot scripts (`main_banchetto_soft_CP_ubuntu.py`,
+`main_banchetto_soft_sleep_AA_ubuntu.py`) drop the deep-sleep-only fields above
+(`SECOND_RELAY_DELAY_SECONDS`, `FINAL_FAIL_*`, `SPECIAL_*`) since there's no power-on sequence
+or no-green recovery gesture to worry about, and add:
+
+| Parameter | Effect |
+|---|---|
+| `FINAL_SCREEN_SIMILARITY_THRESHOLD` | Fallback similarity threshold for the single "FINAL" screenshot, used if the average of `PRECHECK_FRAMES` didn't pass `CARPLAY_SIMILARITY_THRESHOLD` — lets a cycle still PASS if just the very last frame is clearly correct. |
+| `PARTIAL_FAIL_TAP_X` / `PARTIAL_FAIL_TAP_Y` | Corrective tap sent when the final screen check fails (simpler recovery than the deep sleep gesture, since the IVI was never fully powered down). |
+| `PARTIAL_FAIL_WAIT_SECONDS` | Pause after that corrective tap before ending the cycle. |
+
+### 4.7 Output paths
+
+| Parameter | Effect |
+|---|---|
+| `DESKTOP_DIR` | Base output folder for that script (e.g. `output/Test_Deep_Sleep`). Per-cycle session folders are created inside it by `model.new_session_dir()`. |
+| `CSV_SUCCESS` / `CSV_FAILURE` | *(deep sleep only)* Detailed per-event CSVs with full log text and a screenshot link. |
+| `CSV_OUTPUT_DEEP_SLEEP` | *(deep sleep only)* The summary 4-column CSV described in [§3](#3-running-the-tests). |
+| `OUTPUT_CSV` | *(soft boot only)* The 3-column summary CSV for that script. |
+| `BASE_DIR` | Project root, used to build all the paths above — normally left as `Path(__file__).resolve().parent` and not edited by hand. |
 
 ---
 
-## 5. Note di progettazione
+## 5. esoTrace integration
 
-Due comportamenti del codice che potrebbero sembrare bug a prima vista, ma sono intenzionali:
+`esoTraceLogger_ubuntu.py` starts three `jtracecapture.jar` acquisitions (SYS, IVI, ConMod) at
+the beginning of every test cycle and stops them at the end, hooked directly into the two
+functions shared by all four main scripts:
 
-- **Il timer di connessione parte dal secondo click relay, non dal primo (deep sleep)**: il
-  primo impulso relè funge solo da **enabler** (accende il sistema), mentre è solo con il
-  **secondo click** che l'infotainment, se in deep sleep, effettivamente avvia la procedura di
-  startup. Misurare da subito dopo il primo click introdurrebbe nel "Connection time" un tempo
-  morto non significativo (l'attesa configurata in `SECOND_RELAY_DELAY_SECONDS`). Il timer
-  (`model.second_relay_perf`) viene quindi impostato subito dopo il secondo `pulse_relays()` in
-  `wait_for_device()` (`banchetto_controller.py`), non dopo il primo.
-- **`tap()` non passa `-d <SCREEN_DISPLAY_ID>`**: a differenza di `capture_png`/`capture_frame_bgr`
-  (dove serve per evitare l'ambiguità multi-display su `screencap`), il comando `input tap`
-  su questo banco non richiede l'ID display perché esiste un solo display touch — passare
-  l'argomento in più risulta superfluo o viene ignorato. Se in futuro il banco dovesse avere più
-  display touch, questo andrebbe rivisto aggiungendo `_input_display_args()` anche a `tap()`.
+- `start_traces()` is called at the very start of `wait_for_device()` (right after the session
+  timer starts, before the first relay pulse) — so the trace covers the whole cycle including
+  the KL15 power-cycle itself.
+- `stop_traces()` is called inside `end_of_test_relay_sequence()`, right after the end-of-test
+  relay pulse and before the cooldown wait — so it always runs exactly once per cycle, on every
+  exit path (PASS, FAIL, PARTIALLY FAILED, or an unexpected exception), since that function sits
+  on every one of those paths already.
 
-## 6. Troubleshooting rapido
+**Where the files end up**: trace output is written into the **same per-cycle session folder**
+as the screenshots and `tempo_connessione.txt` (`model.session_dir`), not into `jtrace/`. The
+jar itself stays in `jtrace/` (it's invoked with an absolute path), but each `java` process runs
+with its working directory set to that cycle's session folder, so the `-o` output files land
+right next to everything else for that cycle. If `model.session_dir` isn't available yet for
+some reason, the module falls back to `jtrace/` and logs a warning rather than failing silently.
 
-| Sintomo | Causa probabile | Verifica |
+**Fault tolerance**: if `java`, the jar, or `lxterminal` are missing, `start_traces()` logs a
+clear message and skips tracing for that cycle — the test itself is never blocked by a missing
+esoTrace prerequisite.
+
+---
+
+## 6. Design notes
+
+Behaviours that might look like bugs at first glance but are intentional:
+
+- **The connection timer starts from the second relay click, not the first (deep sleep only)**:
+  the first pulse only acts as a power-on **enabler**; it's the **second** click that actually
+  triggers the boot sequence if the IVI was in deep sleep. Timing from the first click would add
+  the `SECOND_RELAY_DELAY_SECONDS` wait as dead time inside "Connection time". The timer
+  (`model.second_relay_perf`) is set right after the second `pulse_relays()` call in
+  `wait_for_device()`.
+- **`tap()` does not pass `-d <SCREEN_DISPLAY_ID>`**: unlike `capture_png`/`capture_frame_bgr`
+  (where it's required to avoid `screencap` ambiguity on multi-display units), `input tap` on
+  this bench doesn't need the display ID — there's only one touch-capable display, and passing
+  the argument breaks the command on this setup. If a future bench has multiple touch displays,
+  this would need revisiting (`_input_display_args()` is already used by `motion_event()` and
+  `swipe()`, just not by `tap()`).
+- **`cooldown_restart()` actively re-checks the IVI is off, it doesn't just sleep**: after the
+  configured wait, it tries an ADB connect; if the IVI answers, it assumes the relay's
+  power-off pulse didn't actually take effect, pulses the relay again, and restarts the wait —
+  rather than starting the next cycle against an IVI that's still on.
+
+---
+
+## 7. Quick troubleshooting
+
+| Symptom | Likely cause | Check |
 |---|---|---|
-| Screenshot vuoto/corrotto, `file` non lo riconosce come PNG | `SCREEN_DISPLAY_ID` sbagliato o mancante, display multipli | Sezione [4.1](#41-cambiare-il-display-da-catturare-screen_display_id) |
-| Script bloccato senza nuovi log dopo "Connessione ADB confermata" | `TARGET_SERIAL` senza porta, o comando ADB in attesa indefinita | Verifica che `TARGET_SERIAL` includa `:5555`; controlla `ADB_COMMAND_TIMEOUT_SECONDS` |
-| `usbrelay` dà errore di permessi | Regola udev assente/non caricata | Sezione [4.2](#42-cambiare-la-scheda-relè), punto 4 |
-| `adb: no devices/emulators found` | Device non connesso, IP cambiato, rete non raggiungibile | `adb connect <ip>:5555` manuale, controlla la rete verso il banco |
-| Tap/swipe non hanno effetto sullo schermo | Display multipli, evento indirizzato al pannello sbagliato | Verifica `_input_display_args()` in `banchetto_utils.py`, vedi nota su `tap()` sopra |
+| Blank/corrupted screenshot | Wrong or missing `SCREEN_DISPLAY_ID` on a multi-display unit | §4.3 |
+| Script stuck with no new logs after relay pulses | `TARGET_SERIAL` missing the port, or a stuck ADB command | §4.1 — confirm `TARGET_SERIAL` includes `:5555`; check `ADB_COMMAND_TIMEOUT_SECONDS` |
+| `usbrelay` permission error | Missing/unloaded udev rule | §2.3 |
+| `adb: no devices/emulators found` | Device unreachable, IP changed, network down | Manual `adb connect <ip>:5555`, check network to the bench |
+| esoTrace windows never open, log says prerequisites missing | `java`/jar/`lxterminal` not installed, or no desktop/X session | §2.4 |
+| esoTrace windows open but immediately show a Java error | `jtracecapture.jar` not in `jtrace/`, or a stale session folder path | Confirm `jtrace/jtracecapture.jar` exists; check the "trace saranno salvate in ..." log line |
+| Tap/swipe has no visible effect | Wrong display targeted | Check `_input_display_args()` in `banchetto_utils_ubuntu.py` and the `tap()` note in §6 |
