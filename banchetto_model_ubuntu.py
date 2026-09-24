@@ -91,22 +91,10 @@ def cooldown_restart(seconds=None):
         except Exception:
             pass
 
-        # Tentativo di connessione ADB.
-        # NB: qui il timeout locale (0.5s) NON è ambiguo come nel loop di attesa accensione:
-        # un device realmente spento non risponde affatto al TCP SYN (nessun RST/ICMP),
-        # quindi il timeout locale è proprio il segnale atteso di "banco spento".
-        ret_code, stdout_text, stderr_text, timed_out, _stale = controller.try_adb_connect_once(attempt=1)
-
-        # Se non c'è stato timeout, returncode == 0 e lo stdout contiene "connected",
-        # il banco è ancora ACCESO. Un timeout locale equivale a "nessuna risposta" = spento.
-        stdout_lower = stdout_text.lower()
-        is_alive = (
-            not timed_out
-            and ret_code == 0
-            and "connected" in stdout_lower
-            and "failed" not in stdout_lower
-            and "cannot" not in stdout_lower
-        )
+        # Check "banco spento" via probe TCP puro: NON passa dal server adb, quindi non
+        # lascia connect pendenti / transport zombie che poi sporcano il ciclo successivo.
+        # Un banco spento non risponde al SYN: il timeout e' proprio il segnale atteso.
+        is_alive = controller.device_port_open(timeout=1.0)
 
         if is_alive:
             msg = "Rilevata connessione ADB: il banco è ancora ACCESO! Invochiamo pulse_relays() e ricominciamo l'attesa."
@@ -174,4 +162,4 @@ def new_session_dir():
     """Crea la cartella della sessione corrente sul Desktop."""
     path = CONFIG.DESKTOP_DIR / f"cattura schermate_{time.strftime('%Y%m%d_%H%M%S')}"
     path.mkdir(parents=True, exist_ok=True)
-    return path
+    return path

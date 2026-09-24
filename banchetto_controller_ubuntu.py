@@ -1,3 +1,5 @@
+import os
+import socket
 import subprocess
 import time
 
@@ -12,10 +14,7 @@ def fatal_stop(reason, screenshot_path=None):
     print(reason)
     view.safe_log_line(reason)
     view.append_output_csv("FAILED", reason)
-    try:
-        subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
-    except Exception:
-        pass
+    adb_kill_server()
     raise SystemExit(1)
 
 
@@ -39,105 +38,144 @@ def pulse_relays():
         fatal_stop("Impossibile comunicare con usbrelay. Controlla la connessione USB o i permessi udev. Arresto definitivo dello script.")
 
 
-def adb_devices_contains_target():
-    """Verifica se il device target è presente nella lista adb devices."""
-    out = subprocess.run([model.CONFIG.ADB, "devices"], capture_output=True, text=True).stdout.splitlines()
-    for line in out[1:]:
-        line = line.strip()
-        if line.startswith(model.CONFIG.TARGET_SERIAL) and line.endswith("device"):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# Helper ADB con timeout duri
+# ---------------------------------------------------------------------------
+
+def _run_adb(args, timeout, capture=True):
+    """Esegue un comando adb con timeout DURO. Non solleva mai su timeout.
+
+    Ritorna (returncode, stdout, stderr, timed_out).
+    capture=False usa DEVNULL: indispensabile per start-server/kill-server, perche' il
+    demone adb puo' ereditare le pipe e far restare appeso subprocess.run().
+    """
+    cmd = [model.CONFIG.ADB] + list(args)
+    try:
+        if capture:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+            return r.returncode, r.stdout.strip(), r.stderr.strip(), False
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+        return r.returncode, "", "", False
+    except subprocess.TimeoutExpired:
+        msg = f"[ADB] TIMEOUT duro ({timeout}s) su: {' '.join(cmd)}"
+        print(msg)
+        view.safe_log_line(msg)
+        return None, "", "", True
 
 
-def adb_disconnect_target():
-    """Forza la chiusura della entry adb (anche se 'stale'/offline) per il device target.
+def adb_kill_server():
+    """kill-server con timeout (non blocca mai il loop)."""
+    _run_adb(["kill-server"], timeout=5, capture=False)
 
-    Necessario perché adb NON rileva da solo che una connessione TCP precedente
-    e' morta lato device (es. dopo un power-cycle KL15): il server continua a
-    rispondere 'already connected' contro una entry ormai fantasma, e 'adb connect'
-    diventa un no-op finche' non si fa un 'adb disconnect' esplicito.
+
+def adb_start_server():
+    """start-server esplicito con timeout; True se il server risponde."""
+    _run_adb(["start-server"], timeout=10, capture=False)
+    rc, _, _, timed_out = _run_adb(["devices"], timeout=5)
+    return (not timed_out) and rc == 0
+
+
+def reset_adb_server():
+    """Riparte da un server adb pulito (nessuna transport residua).
+
+    Va chiamato mentre il banco e' SPENTO, cioe' PRIMA del click relay e fuori dalla
+    finestra cronometrata: cosi' il costo di avvio del server non entra nella misura.
+    """
+    view.safe_log_line("[ADB] reset server adb pre-test")
+    adb_kill_server()
+    time.sleep(0.3)
+    ok = adb_start_server()
+    if not ok:
+        # secondo tentativo, poi si prosegue comunque (il loop di connessione ha i suoi timeout)
+        adb_kill_server()
+        time.sleep(1.0)
+        ok = adb_start_server()
+    msg = f"[ADB] server adb pronto: {ok}"
+    print(msg)
+    view.safe_log_line(msg)
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Probe TCP: rileva la porta adbd SENZA passare dal server adb
+# ---------------------------------------------------------------------------
+
+def device_port_open(timeout=0.15):
+    """True se la porta ADB TCP del banco accetta connessioni.
+
+    Non tocca il server adb: quindi non puo' creare transport zombie, e si puo'
+    sparare a 20-50 Hz senza accumulare richieste pendenti.
     """
     try:
-        result = subprocess.run(
-            [model.CONFIG.ADB, "disconnect", model.CONFIG.TARGET_SERIAL],
-            capture_output=True,
-            text=True,
-            timeout=model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS
-        )
-        text = (result.stdout.strip() + " " + result.stderr.strip()).strip()
-        if text:
-            print(f"[ADB disconnect] {text}")
-            view.safe_log_line(f"[ADB disconnect] {text}")
-    except subprocess.TimeoutExpired:
-        msg = "[ADB disconnect] timeout locale durante il disconnect forzato"
-        print(msg)
-        view.safe_log_line(msg)
+        with socket.create_connection(
+            (model.CONFIG.TARGET_IP, int(model.CONFIG.TARGET_PORT)), timeout=timeout
+        ):
+            return True
+    except OSError:
+        return False
 
 
-def try_adb_connect_once(attempt):
-    """Esegue un tentativo di connessione adb al device target."""
-    try:
-        result = subprocess.run(
-            [model.CONFIG.ADB, "connect", model.CONFIG.TARGET_SERIAL],
-            capture_output=True,
-            text=True,
-            timeout=model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS
-        )
-
-        stdout_text = result.stdout.strip()
-        stderr_text = result.stderr.strip()
-
-        if stdout_text:
-            print(f"[ADB connect #{attempt}] {stdout_text}")
-            view.safe_log_line(f"[ADB connect #{attempt}] {stdout_text}")
-
-        if stderr_text:
-            print(f"[ADB connect #{attempt}][stderr] {stderr_text}")
-            view.safe_log_line(f"[ADB connect #{attempt}][stderr] {stderr_text}")
-
-        # 'already connected' e' un falso positivo se la entry e' in realta' offline/morta
-        # (es. device riavviato dal relay KL15): va trattato come "serve un disconnect", non come successo.
-        stale_already_connected = "already connected" in stdout_text.lower()
-
-        return result.returncode, stdout_text, stderr_text, False, stale_already_connected
-
-    except subprocess.TimeoutExpired:
-        msg = (
-            f"[ADB connect #{attempt}] timeout locale dopo "
-            f"{model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s, nuovo tentativo immediato"
-        )
-        print(msg)
-        view.safe_log_line(msg)
-        return None, "", "", True, False
-
-
-def wait_for_disconnect(timeout_seconds):
-    """Attende che il device sparisca da 'adb devices', a conferma che il power-cycle KL15 sia avvenuto davvero."""
-    deadline = time.perf_counter() + timeout_seconds
-    was_present = adb_devices_contains_target()
-
-    if not was_present:
+def wait_for_port_down(timeout_seconds):
+    """Conferma via TCP che il banco sparisce dopo il click relay (power-cycle avvenuto)."""
+    if not device_port_open(0.1):
         model.mark_event(
-            "ATTENZIONE: device non risultava connesso nemmeno prima del click relay "
-            "(possibile stato residuo o test precedente non concluso correttamente)"
+            "Banco non raggiungibile via TCP al momento del click relay (atteso in deep sleep)"
         )
         return "not_present_before"
 
+    deadline = time.perf_counter() + timeout_seconds
     while time.perf_counter() < deadline:
-        if not adb_devices_contains_target():
-            model.mark_event("Disconnessione del device confermata dopo il click relay: power-cycle avvenuto")
+        if not device_port_open(0.2):
+            model.mark_event("Banco non piu' raggiungibile dopo il click relay: power-cycle avvenuto")
             return "disconnected"
-        time.sleep(0.2)
+        time.sleep(0.05)
 
     model.mark_event(
-        f"ATTENZIONE: il device NON è mai sparito da 'adb devices' entro {timeout_seconds}s dal click relay. "
-        f"Sospetto che il relay non abbia effettivamente tolto/ripristinato l'alimentazione KL15 in questo ciclo."
+        f"ATTENZIONE: la porta ADB e' rimasta raggiungibile per {timeout_seconds}s dal click relay. "
+        f"Sospetto che il relay non abbia effettivamente fatto il power-cycle KL15 in questo ciclo."
     )
     return "never_disconnected"
 
 
+def adb_connect_and_verify(attempt):
+    """UN solo 'adb connect' (mai in parallelo ad altri) + attesa dello stato 'device'.
+
+    Ritorna (ok, dettaglio). Tutti i timeout sono duri e larghi: qui il timeout NON serve
+    a "sparare e dimenticare" ma solo come rete di sicurezza. Il client non viene mai
+    ucciso a meta' handshake, quindi non restano connect pendenti sul server adb.
+    """
+    serial = model.CONFIG.TARGET_SERIAL
+    connect_timeout = getattr(model.CONFIG, "ADB_CONNECT_CMD_TIMEOUT_SECONDS", 4)
+    verify_timeout = getattr(model.CONFIG, "ADB_VERIFY_TIMEOUT_SECONDS", 3)
+
+    rc, out, err, timed_out = _run_adb(["connect", serial], connect_timeout)
+    text = (out + " " + err).strip()
+    if text:
+        print(f"[ADB connect #{attempt}] {text}")
+        view.safe_log_line(f"[ADB connect #{attempt}] {text}")
+    if timed_out:
+        return False, "connect_timeout"
+    if "connected to" not in text.lower():   # copre anche 'already connected to'
+        return False, text or f"rc={rc}"
+
+    # Il connect puo' tornare OK con transport ancora 'offline' (handshake CNXN/AUTH in corso).
+    _, _, _, timed_out = _run_adb(["-s", serial, "wait-for-device"], verify_timeout)
+    if timed_out:
+        return False, "wait_for_device_timeout (transport rimasta offline/connecting)"
+
+    rc, out, err, timed_out = _run_adb(["-s", serial, "get-state"], 2)
+    if not timed_out and out == "device":
+        return True, "device"
+    return False, f"stato={out or err or 'n/d'}"
+
+
 def wait_for_device():
-    """Avvia la sessione e prova a connettersi al device tramite ADB."""
+    """Avvia la sessione e si connette via ADB il piu' presto possibile dopo il boot del banco."""
+    # Server adb pulito PRIMA del click relay (banco spento): niente costo di avvio server
+    # e niente transport residue dal ciclo precedente dentro la finestra cronometrata.
+    reset_adb_server()
+
     model.start_session_timing()
     esotrace.start_traces()
     model.mark_event("Primo click relay di avvio test")
@@ -151,80 +189,42 @@ def wait_for_device():
         model.second_relay_perf = time.perf_counter()
         model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
-        # Verifica esplicita: il device deve sparire dalla rete prima di aspettarne il ritorno.
-        # Se non sparisce mai, il relay non ha davvero fatto il power-cycle e proseguire
-        # sarebbe inutile (si arriverebbe comunque al timeout di GREEN_TIMEOUT_SECONDS a vuoto).
-        disconnect_timeout = getattr(model.CONFIG, "DISCONNECT_CHECK_TIMEOUT_SECONDS", 15)
-        wait_for_disconnect(disconnect_timeout)
+        disconnect_timeout = getattr(model.CONFIG, "DISCONNECT_CHECK_TIMEOUT_SECONDS", 5)
+        wait_for_port_down(disconnect_timeout)
 
-    # Pulizia preventiva: se adb aveva ancora una entry (anche offline/morta) per il device,
-    # 'adb connect' successivi risponderebbero solo 'already connected' senza mai rifare
-    # davvero l'handshake. Un disconnect esplicito forza adb a ripartire da zero.
-    adb_disconnect_target()
+    probe_timeout = getattr(model.CONFIG, "PORT_PROBE_TIMEOUT_SECONDS", 0.15)
+    probe_interval = getattr(model.CONFIG, "PORT_PROBE_INTERVAL_SECONDS", 0.02)
 
     model.mark_event(
-        f"Avvio spam di adb connect con timeout locale {model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s e retry immediato per massimo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s"
+        f"Avvio spam di probe TCP su {model.CONFIG.TARGET_IP}:{model.CONFIG.TARGET_PORT} "
+        f"(timeout {probe_timeout:.2f}s, intervallo {probe_interval:.2f}s) per massimo "
+        f"{model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s; 'adb connect' solo quando la porta risponde"
     )
 
     deadline = time.perf_counter() + model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS
     attempt = 0
-    consecutive_stale = 0
-    forced_disconnect_rounds = 0
+    port_reported = False
 
     while time.perf_counter() < deadline:
-        if adb_devices_contains_target():
-            model.mark_event("Device già visibile in adb devices")
-            return model.CONFIG.TARGET_SERIAL
+        if not device_port_open(probe_timeout):
+            port_reported = False
+            if probe_interval > 0:
+                time.sleep(probe_interval)
+            continue
+
+        if not port_reported:
+            port_reported = True
+            model.mark_event("Porta ADB raggiungibile via TCP: lancio adb connect")
 
         attempt += 1
-        _, _, _, timed_out, stale_already_connected = try_adb_connect_once(attempt)
-
-        if stale_already_connected:
-            consecutive_stale += 1
-        else:
-            consecutive_stale = 0
-
-        # Se 'adb connect' continua a rispondere 'already connected' senza che il device
-        # risulti mai 'device' in adb devices, la entry e' bloccata/stale: forziamo un
-        # disconnect per rompere lo stallo, invece di spammare connect a vuoto per 120s.
-        if consecutive_stale >= 5:
-            forced_disconnect_rounds += 1
-            model.mark_event(
-                f"Rilevati {consecutive_stale} 'already connected' consecutivi senza stato 'device': "
-                f"forzo un disconnect per rompere la entry adb bloccata (round {forced_disconnect_rounds})"
-            )
-            adb_disconnect_target()
-            consecutive_stale = 0
-            # La rimozione della transport lato server adb dopo 'disconnect' non e' istantanea:
-            # e' asincrona internamente. Senza una piccola pausa, il prossimo 'connect' arriva
-            # spesso troppo presto e trova ancora la vecchia entry, riottenendo 'already connected'
-            # e ripetendo il ciclo inutilmente per diversi secondi.
-            time.sleep(0.5)
-
-            # Se anche dopo alcuni round di disconnect mirato la situazione non si sblocca,
-            # il problema non e' piu' la singola transport ma lo stato interno del server adb
-            # stesso (desync tra cio' che risponde 'connect' e cio' che elenca 'devices').
-            # Un 'disconnect' mirato non basta: serve un reset completo del demone.
-            if forced_disconnect_rounds >= 3:
-                model.mark_event(
-                    f"{forced_disconnect_rounds} round di disconnect mirato non hanno sbloccato la situazione: "
-                    f"eseguo 'adb kill-server' per un reset completo del demone adb"
-                )
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
-                forced_disconnect_rounds = 0
-                # Il prossimo 'adb connect' fara' ripartire da solo il server (start-server
-                # implicito): concediamo un margine un po' piu' ampio prima di ririprovare.
-                time.sleep(1.5)
-
-        if adb_devices_contains_target():
+        ok, detail = adb_connect_and_verify(attempt)
+        if ok:
             model.mark_event(f"Connessione ADB riuscita al tentativo {attempt}")
             return model.CONFIG.TARGET_SERIAL
 
-        if timed_out:
-            continue
-
-        if model.CONFIG.ADB_CONNECT_SPAM_INTERVAL > 0:
-            time.sleep(model.CONFIG.ADB_CONNECT_SPAM_INTERVAL)
+        model.mark_event(f"Tentativo adb connect #{attempt} non riuscito ({detail}): disconnect e nuovo tentativo")
+        _run_adb(["disconnect", model.CONFIG.TARGET_SERIAL], 2)
+        time.sleep(0.1)
 
     model.mark_event(f"Timeout connessione ADB dopo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS} secondi")
     return None
@@ -393,7 +393,7 @@ def save_failure_final(serial, reason, gray_to_green_elapsed=None):
     """Salva il frame finale di fallimento e registra il risultato e la timeline."""
     path = None
     try:
-        png = utils.capture_png(serial)
+        png = utils.capture_png(serial) if serial else None
         if png:
             final_name = f"FINAL_FAIL_{time.strftime('%Y%m%d_%H%M%S')}.png"
             path = utils.save_png(png, final_name)
@@ -457,14 +457,14 @@ def run_deep_sleep_loop():
 
             if not serial:
                 reason = (
-                    f"Device ADB {model.CONFIG.TARGET_IP} non disponibile dopo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS} secondi di spam adb connect con timeout locale "
-                    f"{model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s. Riavvio procedura..."
+                    f"Device ADB {model.CONFIG.TARGET_SERIAL} non disponibile dopo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS} secondi "
+                    f"(probe TCP + adb connect verificato). Riavvio procedura..."
                 )
                 print(reason)
-                save_failure_final(model.CONFIG.TARGET_IP, reason, None)
+                save_failure_final(None, reason, None)
                 view.safe_log_line(reason)
                 view.log_output_deep_sleep_failed(reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -482,7 +482,7 @@ def run_deep_sleep_loop():
                 utils.maybe_execute_no_green_final_recovery(serial, final_fail_path)
 
                 view.log_output_deep_sleep_failed(reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -500,7 +500,7 @@ def run_deep_sleep_loop():
                 utils.tap(serial, model.CONFIG.FINAL_FAIL_TAP_X, model.CONFIG.FINAL_FAIL_TAP_Y)
 
                 view.log_output_deep_sleep_partially_failed(avg_score)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -516,7 +516,7 @@ def run_deep_sleep_loop():
             save_success_final(serial, success_msg, gray_to_green_elapsed)
             view.log_output_deep_sleep_passed()
 
-            subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+            adb_kill_server()
             end_of_test_relay_sequence()
             continue
 
@@ -534,34 +534,11 @@ def run_deep_sleep_loop():
                     None
                 )
                 view.log_output_deep_sleep_failed(fail_reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
             except Exception:
                 pass
             end_of_test_relay_sequence()
             continue
-
-
-def save_soft_final_screenshot(serial, prefix):
-    """Cattura e salva lo screenshot finale di un ciclo Soft Boot, se possibile.
-
-    Analogo a save_failure_final()/save_success_final() del ciclo Deep Sleep, ma
-    senza timeline di durata grigio->verde (non pertinente al Soft Boot). Non
-    alza mai eccezioni: se la cattura fallisce, logga e ritorna None invece di
-    interrompere il ciclo (a differenza del precedente utils.save_png(b"", "")
-    che falliva sempre con IsADirectoryError perche' un filename vuoto risolve
-    alla cartella di sessione stessa, non a un file).
-    """
-    path = None
-    try:
-        png = utils.capture_png(serial)
-        if png:
-            final_name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
-            path = utils.save_png(png, final_name)
-            model.mark_event(f"Frame finale salvato: {final_name}")
-    except Exception as e:
-        print(f"Errore nel salvataggio screenshot finale: {e}")
-        view.safe_log_line(f"Errore screenshot finale: {e}")
-    return path
 
 
 def run_soft_loop():
@@ -580,8 +557,9 @@ def run_soft_loop():
                     f"{model.CONFIG.ADB_CONNECT_SPAM_INTERVAL:.2f} secondi."
                 )
                 print(reason)
+                utils.save_png(b"", "")
                 view.append_output_csv("FAILED", reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -593,9 +571,9 @@ def run_soft_loop():
                     f"La ROI sinistra {model.CONFIG.LEFT_STATUS_ROI} non è passata da grigio a verde entro {model.CONFIG.GREEN_TIMEOUT_SECONDS} secondi."
                 )
                 print(reason)
-                save_soft_final_screenshot(serial, "FINAL_FAIL")
+                utils.save_png(b"", "")
                 view.append_output_csv("FAILED", reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -615,9 +593,9 @@ def run_soft_loop():
                 time.sleep(model.CONFIG.PARTIAL_FAIL_WAIT_SECONDS)
                 model.mark_event(f"Attesa correttiva di {model.CONFIG.PARTIAL_FAIL_WAIT_SECONDS} secondi completata")
 
-                save_soft_final_screenshot(serial, "FINAL_FAIL")
+                utils.save_png(b"", "")
                 view.append_output_csv("PARTIALLY FAILED", partial_reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -631,10 +609,10 @@ def run_soft_loop():
                 success_reason += " L'analisi è stata completata sullo screen FINAL perché i 5 frame iniziali non hanno superato la soglia di similarità."
 
             print(success_reason)
-            save_soft_final_screenshot(serial, "FINAL_OK")
+            utils.save_png(b"", "")
             view.append_output_csv("PASSED", success_reason)
 
-            subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+            adb_kill_server()
             end_of_test_relay_sequence()
             continue
 
@@ -645,8 +623,8 @@ def run_soft_loop():
             try:
                 view.safe_log_line(f"Errore inatteso: {e}")
                 view.append_output_csv("FAILED", f"Errore inatteso: {e}")
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
             except Exception:
                 pass
             end_of_test_relay_sequence()
-            continue
+            continue
