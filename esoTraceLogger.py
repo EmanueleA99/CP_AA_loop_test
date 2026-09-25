@@ -147,7 +147,7 @@ def _create_conmod_script(jar_path, output_dir):
     jTraceCapture va lanciato solo dopo che il forward è riuscito — altrimenti si connette
     a una porta locale non ancora aperta e fallisce silenziosamente.
     """
-    serial = _target_serial()
+    serial = "127.0.0.1"
     if not serial:
         _log("esoTrace: TARGET_SERIAL non disponibile in CONFIG, impossibile avviare ConMod (serve per l'adb forward)")
         return None
