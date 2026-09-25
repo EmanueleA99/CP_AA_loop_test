@@ -17,6 +17,12 @@ Difetti corretti rispetto allo script originale ricevuto:
   perché il logging delle tre partizioni SYS, IVI e ConMod è quanto richiesto.
 - Aggiunto un controllo dei prerequisiti (java, jar, lxterminal) prima di
   lanciare i processi, con messaggi chiari nel log invece di fallimenti muti.
+- ConMod attende un `adb forward` prima di avviare jTraceCapture: la partizione
+  ConMod non è raggiungibile via IP diretto come SYS/IVI, serve prima inoltrare
+  la porta del device sulla stessa porta in locale. Lo script genera uno
+  script bash dedicato (come nella versione Plugbot) che fa il loop di
+  `adb forward` finché non riesce, poi lancia il jar — invece di lanciare
+  subito jTraceCapture assumendo che il forward sia già attivo.
 """
 
 import shutil
@@ -47,11 +53,16 @@ JTRACE_DIR = Path(__file__).resolve().parent / "jtrace"
 JAR_NAME = "jtracecapture.jar"
 JAR_PATH = JTRACE_DIR / JAR_NAME
 
+# SYS e IVI si collegano direttamente all'IP dell'infotainment: nessun forward necessario.
 _JOBS = [
     ("SYS", 'java -jar "{jar}" -o traceSYS.esotrace_#yyyyMMddhhmm# 172.16.250.248 -p 21005'),
     ("IVI", 'java -jar "{jar}" -o traceIVI.esotrace_#yyyyMMddhhmm# 172.16.250.248 -p 21002'),
-    ("ConMod", 'java -jar "{jar}" -o traceConMod.esotrace_#yyyyMMddhhmm# 127.0.0.1 -p 21002 -k 150'),
 ]
+
+# ConMod non è raggiungibile via IP diretto: serve un `adb forward` sulla stessa porta
+# prima di poter avviare jTraceCapture puntato su 127.0.0.1.
+CONMOD_PORT = "21002"
+CONMOD_CMD_TEMPLATE = 'java -jar "{jar}" -o traceConMod.esotrace_#yyyyMMddhhmm# 127.0.0.1 -p {port} -k 150'
 
 
 def _log(msg):
@@ -110,6 +121,54 @@ def _resolve_output_dir():
     return JTRACE_DIR
 
 
+def _adb_binary():
+    """Ritorna l'eseguibile adb configurato nel CONFIG del test corrente, o 'adb' di default."""
+    if _HAS_MODEL:
+        config = getattr(model, "CONFIG", None)
+        if config is not None:
+            return getattr(config, "ADB", "adb")
+    return "adb"
+
+
+def _target_serial():
+    """Ritorna il serial ADB del device sotto test (es. '172.16.250.248:5555'), se disponibile."""
+    if _HAS_MODEL:
+        config = getattr(model, "CONFIG", None)
+        if config is not None:
+            return getattr(config, "TARGET_SERIAL", None)
+    return None
+
+
+def _create_conmod_script(jar_path, output_dir):
+    """Crea lo script bash che attende l'adb forward e poi avvia jTraceCapture per ConMod.
+
+    ConMod, a differenza di SYS/IVI, non è raggiungibile via IP diretto: serve prima
+    inoltrare (via `adb forward`) la porta del device sulla stessa porta in locale, e
+    jTraceCapture va lanciato solo dopo che il forward è riuscito — altrimenti si connette
+    a una porta locale non ancora aperta e fallisce silenziosamente.
+    """
+    serial = _target_serial()
+    if not serial:
+        _log("esoTrace: TARGET_SERIAL non disponibile in CONFIG, impossibile avviare ConMod (serve per l'adb forward)")
+        return None
+
+    adb = _adb_binary()
+    script_path = output_dir / "start_conmod.sh"
+    content = (
+        "#!/bin/bash\n"
+        f"cd \"{output_dir}\"\n"
+        f"echo \"[ConMod] In attesa del device {serial}...\"\n"
+        f"until {adb} -s {serial} forward tcp:{CONMOD_PORT} tcp:{CONMOD_PORT} 2>/dev/null; do\n"
+        "    sleep 1\n"
+        "done\n"
+        f"echo \"[ConMod] Port forward tcp:{CONMOD_PORT} attivo! Avvio jTraceCapture...\"\n"
+        f"{CONMOD_CMD_TEMPLATE.format(jar=jar_path, port=CONMOD_PORT)}\n"
+    )
+    script_path.write_text(content)
+    script_path.chmod(0o755)
+    return script_path
+
+
 def start_traces():
     """Avvia le acquisizioni jTraceCapture per SYS, IVI e ConMod, una per finestra lxterminal."""
     global _processes
@@ -144,9 +203,35 @@ def start_traces():
         except Exception as e:
             _log(f"esoTrace: impossibile avviare acquisizione {title}: {e}")
 
+    # ConMod: script dedicato che attende l'adb forward prima di avviare jTraceCapture
+    # (vedi _create_conmod_script). Non fa parte di _JOBS perché il comando da lanciare
+    # in lxterminal è lo script stesso, non una riga java diretta.
+    conmod_script = _create_conmod_script(JAR_PATH, output_dir)
+    if conmod_script is not None:
+        try:
+            p_conmod = subprocess.Popen(
+                [
+                    "lxterminal",
+                    "--title", "ConMod",
+                    "--command", f"bash \"{conmod_script}\""
+                ],
+                cwd=str(output_dir)
+            )
+            _processes.append(p_conmod)
+            _log("esoTrace: avviata finestra ConMod con attesa adb forward")
+        except Exception as e:
+            _log(f"esoTrace: impossibile avviare acquisizione ConMod: {e}")
+
 
 def stop_traces():
     """Termina tutte le acquisizioni jTraceCapture attive e chiude le relative finestre."""
+    # Ferma anche l'eventuale loop di attesa dell'adb forward per ConMod, se il forward
+    # non è mai riuscito e lo script è ancora fermo nel while.
+    try:
+        subprocess.run(["pkill", "-f", "start_conmod.sh"], check=False)
+    except Exception:
+        pass
+
     try:
         subprocess.run(["pkill", "-f", JAR_NAME], check=False)
     except Exception as e:
@@ -154,7 +239,7 @@ def stop_traces():
 
     time.sleep(1)
 
-    for title, _cmd in _JOBS:
+    for title in ["SYS", "IVI", "ConMod"]:
         try:
             subprocess.run(["wmctrl", "-c", title], check=False)
         except FileNotFoundError:
