@@ -1,10 +1,12 @@
 import atexit
+import socket
 import subprocess
 import time
 
 import banchetto_model as model
 import banchetto_view as view
 import banchetto_utils as utils
+import esoTraceLogger as esotrace
 
 try:
     from gpiozero import LED
@@ -48,10 +50,7 @@ def fatal_stop(reason, screenshot_path=None):
     print(reason)
     view.safe_log_line(reason)
     view.append_output_csv("FAILED", reason)
-    try:
-        subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
-    except Exception:
-        pass
+    adb_kill_server()
     raise SystemExit(1)
 
 
@@ -59,7 +58,7 @@ def pulse_relays():
     """Invia un impulso ai relè via GPIO per simulare la pressione del pulsante KL15.
 
     Il pilotaggio avviene direttamente sui pin GPIO del Raspberry Pi (libreria
-    gpiozero), non più tramite la CLI 'usbrelay': quest'ultima serve solo per
+    gpiozero), non tramite la CLI 'usbrelay': quest'ultima serve solo per
     relay board USB HID, mentre le board a moduli relè (es. keyestudio) si
     collegano direttamente ai pin GPIO e vanno pilotate a livello TTL.
 
@@ -105,87 +104,193 @@ def pulse_relays():
         )
 
 
-def adb_devices_contains_target():
-    """Verifica se il device target è presente nella lista adb devices."""
-    out = subprocess.run([model.CONFIG.ADB, "devices"], capture_output=True, text=True).stdout.splitlines()
-    for line in out[1:]:
-        line = line.strip()
-        if line.startswith(model.CONFIG.TARGET_SERIAL) and line.endswith("device"):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# Helper ADB con timeout duri
+# ---------------------------------------------------------------------------
 
+def _run_adb(args, timeout, capture=True):
+    """Esegue un comando adb con timeout DURO. Non solleva mai su timeout.
 
-def try_adb_connect_once(attempt):
-    """Esegue un tentativo di connessione adb al device target."""
+    Ritorna (returncode, stdout, stderr, timed_out).
+    capture=False usa DEVNULL: indispensabile per start-server/kill-server, perche' il
+    demone adb puo' ereditare le pipe e far restare appeso subprocess.run().
+    """
+    cmd = [model.CONFIG.ADB] + list(args)
     try:
-        result = subprocess.run(
-            [model.CONFIG.ADB, "connect", model.CONFIG.TARGET_SERIAL],
-            capture_output=True,
-            text=True,
-            timeout=model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS
-        )
-
-        stdout_text = result.stdout.strip()
-        stderr_text = result.stderr.strip()
-
-        if stdout_text:
-            print(f"[ADB connect #{attempt}] {stdout_text}")
-            view.safe_log_line(f"[ADB connect #{attempt}] {stdout_text}")
-
-        if stderr_text:
-            print(f"[ADB connect #{attempt}][stderr] {stderr_text}")
-            view.safe_log_line(f"[ADB connect #{attempt}][stderr] {stderr_text}")
-
-        return result.returncode, stdout_text, stderr_text, False
-
+        if capture:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+            return r.returncode, r.stdout.strip(), r.stderr.strip(), False
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+        return r.returncode, "", "", False
     except subprocess.TimeoutExpired:
-        msg = (
-            f"[ADB connect #{attempt}] timeout locale dopo "
-            f"{model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s, nuovo tentativo immediato"
-        )
+        msg = f"[ADB] TIMEOUT duro ({timeout}s) su: {' '.join(cmd)}"
         print(msg)
         view.safe_log_line(msg)
         return None, "", "", True
 
 
+def adb_kill_server():
+    """kill-server con timeout (non blocca mai il loop)."""
+    _run_adb(["kill-server"], timeout=5, capture=False)
+
+
+def adb_start_server():
+    """start-server esplicito con timeout; True se il server risponde."""
+    _run_adb(["start-server"], timeout=10, capture=False)
+    rc, _, _, timed_out = _run_adb(["devices"], timeout=5)
+    return (not timed_out) and rc == 0
+
+
+def reset_adb_server():
+    """Riparte da un server adb pulito (nessuna transport residua).
+
+    Va chiamato mentre il banco e' SPENTO, cioe' PRIMA del click relay e fuori dalla
+    finestra cronometrata: cosi' il costo di avvio del server non entra nella misura.
+    """
+    view.safe_log_line("[ADB] reset server adb pre-test")
+    adb_kill_server()
+    time.sleep(0.3)
+    ok = adb_start_server()
+    if not ok:
+        # secondo tentativo, poi si prosegue comunque (il loop di connessione ha i suoi timeout)
+        adb_kill_server()
+        time.sleep(1.0)
+        ok = adb_start_server()
+    msg = f"[ADB] server adb pronto: {ok}"
+    print(msg)
+    view.safe_log_line(msg)
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Probe TCP: rileva la porta adbd SENZA passare dal server adb
+# ---------------------------------------------------------------------------
+
+def device_port_open(timeout=0.15):
+    """True se la porta ADB TCP del banco accetta connessioni.
+
+    Non tocca il server adb: quindi non puo' creare transport zombie, e si puo'
+    sparare a 20-50 Hz senza accumulare richieste pendenti.
+    """
+    try:
+        with socket.create_connection(
+            (model.CONFIG.TARGET_IP, int(model.CONFIG.TARGET_PORT)), timeout=timeout
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_port_down(timeout_seconds):
+    """Conferma via TCP che il banco sparisce dopo il click relay (power-cycle avvenuto)."""
+    if not device_port_open(0.1):
+        model.mark_event(
+            "Banco non raggiungibile via TCP al momento del click relay (atteso in deep sleep)"
+        )
+        return "not_present_before"
+
+    deadline = time.perf_counter() + timeout_seconds
+    while time.perf_counter() < deadline:
+        if not device_port_open(0.2):
+            model.mark_event("Banco non piu' raggiungibile dopo il click relay: power-cycle avvenuto")
+            return "disconnected"
+        time.sleep(0.05)
+
+    model.mark_event(
+        f"ATTENZIONE: la porta ADB e' rimasta raggiungibile per {timeout_seconds}s dal click relay. "
+        f"Sospetto che il relay non abbia effettivamente fatto il power-cycle KL15 in questo ciclo."
+    )
+    return "never_disconnected"
+
+
+def adb_connect_and_verify(attempt):
+    """UN solo 'adb connect' (mai in parallelo ad altri) + attesa dello stato 'device'.
+
+    Ritorna (ok, dettaglio). Tutti i timeout sono duri e larghi: qui il timeout NON serve
+    a "sparare e dimenticare" ma solo come rete di sicurezza. Il client non viene mai
+    ucciso a meta' handshake, quindi non restano connect pendenti sul server adb.
+    """
+    serial = model.CONFIG.TARGET_SERIAL
+    connect_timeout = getattr(model.CONFIG, "ADB_CONNECT_CMD_TIMEOUT_SECONDS", 4)
+    verify_timeout = getattr(model.CONFIG, "ADB_VERIFY_TIMEOUT_SECONDS", 3)
+
+    rc, out, err, timed_out = _run_adb(["connect", serial], connect_timeout)
+    text = (out + " " + err).strip()
+    if text:
+        print(f"[ADB connect #{attempt}] {text}")
+        view.safe_log_line(f"[ADB connect #{attempt}] {text}")
+    if timed_out:
+        return False, "connect_timeout"
+    if "connected to" not in text.lower():   # copre anche 'already connected to'
+        return False, text or f"rc={rc}"
+
+    # Il connect puo' tornare OK con transport ancora 'offline' (handshake CNXN/AUTH in corso).
+    _, _, _, timed_out = _run_adb(["-s", serial, "wait-for-device"], verify_timeout)
+    if timed_out:
+        return False, "wait_for_device_timeout (transport rimasta offline/connecting)"
+
+    rc, out, err, timed_out = _run_adb(["-s", serial, "get-state"], 2)
+    if not timed_out and out == "device":
+        return True, "device"
+    return False, f"stato={out or err or 'n/d'}"
+
+
 def wait_for_device():
-    """Avvia la sessione e prova a connettersi al device tramite ADB."""
+    """Avvia la sessione e si connette via ADB il piu' presto possibile dopo il boot del banco."""
+    # Server adb pulito PRIMA del click relay (banco spento): niente costo di avvio server
+    # e niente transport residue dal ciclo precedente dentro la finestra cronometrata.
+    reset_adb_server()
+
     model.start_session_timing()
+    esotrace.start_traces()
     model.mark_event("Primo click relay di avvio test")
     pulse_relays()
-    model.second_relay_perf = time.perf_counter()
-    model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
 
     if getattr(model.CONFIG, "SECOND_RELAY_DELAY_SECONDS", None) is not None:
         model.mark_event(f"Attesa passiva di {model.CONFIG.SECOND_RELAY_DELAY_SECONDS} secondi dopo il primo click relay")
         time.sleep(model.CONFIG.SECOND_RELAY_DELAY_SECONDS)
         model.mark_event("Secondo click relay prima della connessione ADB")
         pulse_relays()
+        model.second_relay_perf = time.perf_counter()
+        model.mark_event("Cronometro principale avviato: misuro dal click relay al verde")
+
+        disconnect_timeout = getattr(model.CONFIG, "DISCONNECT_CHECK_TIMEOUT_SECONDS", 5)
+        wait_for_port_down(disconnect_timeout)
+
+    probe_timeout = getattr(model.CONFIG, "PORT_PROBE_TIMEOUT_SECONDS", 0.15)
+    probe_interval = getattr(model.CONFIG, "PORT_PROBE_INTERVAL_SECONDS", 0.02)
 
     model.mark_event(
-        f"Avvio spam di adb connect con timeout locale {model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s e retry immediato per massimo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s"
+        f"Avvio spam di probe TCP su {model.CONFIG.TARGET_IP}:{model.CONFIG.TARGET_PORT} "
+        f"(timeout {probe_timeout:.2f}s, intervallo {probe_interval:.2f}s) per massimo "
+        f"{model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS}s; 'adb connect' solo quando la porta risponde"
     )
 
     deadline = time.perf_counter() + model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS
     attempt = 0
+    port_reported = False
 
     while time.perf_counter() < deadline:
-        if adb_devices_contains_target():
-            model.mark_event("Device già visibile in adb devices")
-            return model.CONFIG.TARGET_SERIAL
+        if not device_port_open(probe_timeout):
+            port_reported = False
+            if probe_interval > 0:
+                time.sleep(probe_interval)
+            continue
+
+        if not port_reported:
+            port_reported = True
+            model.mark_event("Porta ADB raggiungibile via TCP: lancio adb connect")
 
         attempt += 1
-        _, _, _, timed_out = try_adb_connect_once(attempt)
-
-        if adb_devices_contains_target():
+        ok, detail = adb_connect_and_verify(attempt)
+        if ok:
             model.mark_event(f"Connessione ADB riuscita al tentativo {attempt}")
             return model.CONFIG.TARGET_SERIAL
 
-        if timed_out:
-            continue
-
-        if model.CONFIG.ADB_CONNECT_SPAM_INTERVAL > 0:
-            time.sleep(model.CONFIG.ADB_CONNECT_SPAM_INTERVAL)
+        model.mark_event(f"Tentativo adb connect #{attempt} non riuscito ({detail}): disconnect e nuovo tentativo")
+        _run_adb(["disconnect", model.CONFIG.TARGET_SERIAL], 2)
+        time.sleep(0.1)
 
     model.mark_event(f"Timeout connessione ADB dopo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS} secondi")
     return None
@@ -195,11 +300,12 @@ def end_of_test_relay_sequence():
     """Chiude il test azionando il relay e attivando il cooldown."""
     model.mark_event("Click relay di fine test")
     pulse_relays()
+    esotrace.stop_traces()
     model.cooldown_restart(model.CONFIG.RESTART_DELAY_SECONDS)
 
 
 def wait_for_gray_to_green(serial):
-    """Monitora la ROI finché non passa da grigio a verde."""
+    """Monitora la ROI finché non passa da grigio a verde ad alte prestazioni (10+ FPS)."""
     model.mark_event("Avvio catture schermata e monitoraggio ROI sinistra CarPlay")
     if getattr(model.CONFIG, "START_ANALYSIS_TAP_X", None) is not None:
         model.mark_event(f"Tap singolo di avvio analisi su ({model.CONFIG.START_ANALYSIS_TAP_X}, {model.CONFIG.START_ANALYSIS_TAP_Y})")
@@ -210,16 +316,26 @@ def wait_for_gray_to_green(serial):
     green_elapsed = None
     hard_deadline = time.perf_counter() + model.CONFIG.GREEN_TIMEOUT_SECONDS
 
+    # Imposta la cadenza del loop in base a CONFIG.FPS (es. 10 FPS = 0.1s a frame)
+    target_fps = getattr(model.CONFIG, "FPS", 10)
+    frame_interval = 1.0 / target_fps
+
     while time.perf_counter() <= hard_deadline:
-        png = utils.capture_png(serial)
-        if not png:
-            time.sleep(1 / model.CONFIG.FPS)
+        loop_start = time.perf_counter()
+
+        # 1. Cattura ultra-veloce diretta in RAM (senza codifica PNG su Android)
+        frame_bgr = utils.capture_frame_bgr(serial)
+        if frame_bgr is None:
+            # Se la cattura fallisce, rispetta la cadenza ed esegui il retry
+            elapsed = time.perf_counter() - loop_start
+            time.sleep(max(0.0, frame_interval - elapsed))
             continue
 
-        utils.save_png(png, f"monitor_left_roi_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
-        gray_distance, _ = utils.mean_color_distance(png, model.CONFIG.LEFT_STATUS_ROI, model.CONFIG.LEFT_GRAY_TARGET_HEX)
-        is_green_now, green_metrics = utils.is_roi_green(png, model.CONFIG.LEFT_STATUS_ROI)
+        # 2. Analisi cromatiche in memoria RAM su matrice NumPy
+        gray_distance, _ = utils.mean_color_distance(frame_bgr, model.CONFIG.LEFT_STATUS_ROI, model.CONFIG.LEFT_GRAY_TARGET_HEX)
+        is_green_now, green_metrics = utils.is_roi_green(frame_bgr, model.CONFIG.LEFT_STATUS_ROI)
 
+        # 3. Log a schermo e su file
         msg = (
             f"[T+{model.format_elapsed(model.session_elapsed())}] ROI sinistra frame {idx}: "
             f"dist_grigio={gray_distance:.2f}, "
@@ -231,12 +347,22 @@ def wait_for_gray_to_green(serial):
         print(msg)
         view.safe_log_line(msg)
 
+        # 4. Controllo transizione FASE GRIGIA
         if not gray_seen and gray_distance <= model.CONFIG.LEFT_GRAY_DISTANCE_THRESHOLD:
             gray_seen = True
             model.gray_detect_start_perf = time.perf_counter()
             model.mark_event(f"Rilevato stato grigio nella ROI sinistra (target {model.CONFIG.LEFT_GRAY_TARGET_HEX})")
 
+            # Salva su disco solo lo screenshot di avvenuta rilevazione del grigio
+            png_bytes = utils.bgr_to_png(frame_bgr)
+            utils.save_png(png_bytes, f"monitor_left_GRAY_frame_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+
+        # 5. Controllo transizione FASE VERDE (Obiettivo)
         if is_green_now:
+            # Salva su disco lo screenshot dell'obiettivo raggiunto
+            png_bytes = utils.bgr_to_png(frame_bgr)
+            utils.save_png(png_bytes, f"monitor_left_GREEN_frame_{idx}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+
             if model.second_relay_perf is not None:
                 model.second_relay_to_green_elapsed = time.perf_counter() - model.second_relay_perf
                 model.mark_event(
@@ -257,7 +383,12 @@ def wait_for_gray_to_green(serial):
             return True, green_elapsed
 
         idx += 1
-        time.sleep(1 / model.CONFIG.FPS)
+
+        # 6. Pacing dinamico del tempo per mantenere l'FPS richiesto
+        elapsed = time.perf_counter() - loop_start
+        sleep_time = frame_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
     model.mark_event(f"Timeout massimo di {model.CONFIG.GREEN_TIMEOUT_SECONDS} secondi senza passaggio al verde")
     return False, green_elapsed
@@ -329,7 +460,7 @@ def save_failure_final(serial, reason, gray_to_green_elapsed=None):
     """Salva il frame finale di fallimento e registra il risultato e la timeline."""
     path = None
     try:
-        png = utils.capture_png(serial)
+        png = utils.capture_png(serial) if serial else None
         if png:
             final_name = f"FINAL_FAIL_{time.strftime('%Y%m%d_%H%M%S')}.png"
             path = utils.save_png(png, final_name)
@@ -393,14 +524,14 @@ def run_deep_sleep_loop():
 
             if not serial:
                 reason = (
-                    f"Device ADB {model.CONFIG.TARGET_IP} non disponibile dopo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS} secondi di spam adb connect con timeout locale "
-                    f"{model.CONFIG.ADB_SINGLE_CONNECT_TIMEOUT_SECONDS:.2f}s. Riavvio procedura..."
+                    f"Device ADB {model.CONFIG.TARGET_SERIAL} non disponibile dopo {model.CONFIG.ADB_CONNECT_TIMEOUT_SECONDS} secondi "
+                    f"(probe TCP + adb connect verificato). Riavvio procedura..."
                 )
                 print(reason)
-                save_failure_final(model.CONFIG.TARGET_IP, reason, None)
+                save_failure_final(None, reason, None)
                 view.safe_log_line(reason)
                 view.log_output_deep_sleep_failed(reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -418,7 +549,7 @@ def run_deep_sleep_loop():
                 utils.maybe_execute_no_green_final_recovery(serial, final_fail_path)
 
                 view.log_output_deep_sleep_failed(reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -436,7 +567,7 @@ def run_deep_sleep_loop():
                 utils.tap(serial, model.CONFIG.FINAL_FAIL_TAP_X, model.CONFIG.FINAL_FAIL_TAP_Y)
 
                 view.log_output_deep_sleep_partially_failed(avg_score)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -452,7 +583,7 @@ def run_deep_sleep_loop():
             save_success_final(serial, success_msg, gray_to_green_elapsed)
             view.log_output_deep_sleep_passed()
 
-            subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+            adb_kill_server()
             end_of_test_relay_sequence()
             continue
 
@@ -470,7 +601,7 @@ def run_deep_sleep_loop():
                     None
                 )
                 view.log_output_deep_sleep_failed(fail_reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
             except Exception:
                 pass
             end_of_test_relay_sequence()
@@ -495,7 +626,7 @@ def run_soft_loop():
                 print(reason)
                 utils.save_png(b"", "")
                 view.append_output_csv("FAILED", reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -509,7 +640,7 @@ def run_soft_loop():
                 print(reason)
                 utils.save_png(b"", "")
                 view.append_output_csv("FAILED", reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -531,7 +662,7 @@ def run_soft_loop():
 
                 utils.save_png(b"", "")
                 view.append_output_csv("PARTIALLY FAILED", partial_reason)
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
                 end_of_test_relay_sequence()
                 continue
 
@@ -548,7 +679,7 @@ def run_soft_loop():
             utils.save_png(b"", "")
             view.append_output_csv("PASSED", success_reason)
 
-            subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+            adb_kill_server()
             end_of_test_relay_sequence()
             continue
 
@@ -559,7 +690,7 @@ def run_soft_loop():
             try:
                 view.safe_log_line(f"Errore inatteso: {e}")
                 view.append_output_csv("FAILED", f"Errore inatteso: {e}")
-                subprocess.run([model.CONFIG.ADB, "kill-server"], capture_output=True, text=True)
+                adb_kill_server()
             except Exception:
                 pass
             end_of_test_relay_sequence()

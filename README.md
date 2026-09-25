@@ -1,18 +1,24 @@
-# Banchetto Test CarPlay / Android Auto — Ubuntu
+# Banchetto Test CarPlay / Android Auto — Raspberry Pi (GPIO)
 
 Script per l'automazione del banco di test hardware-in-the-loop che verifica il risveglio e
 l'avvio di Apple CarPlay / Android Auto su un infotainment (ICC), simulando la pressione del
-pulsante KL15 tramite una scheda relè USB e monitorando lo schermo via ADB.
+pulsante KL15 tramite una scheda relè collegata ai pin GPIO di un Raspberry Pi e monitorando lo
+schermo via ADB.
 
 Il banco copre due scenari:
 
-- **Deep Sleep** (`main_banchetto_deep_sleep_cp.py`): il device parte da spento/deep sleep,
-  richiede due impulsi relè in sequenza (accensione + KL15) e verifica sia il passaggio
-  dell'icona di stato CarPlay da grigia a verde, sia che la sessione CarPlay sia effettivamente
-  in foreground a schermo intero.
+- **Deep Sleep** (`main_banchetto_deep_sleep_cp.py`, `main_banchetto_deep_sleep_aa.py`): il
+  device parte da spento/deep sleep, richiede due impulsi relè in sequenza (accensione + KL15) e
+  verifica sia il passaggio dell'icona di stato CarPlay/AA da grigia a verde, sia che la sessione
+  sia effettivamente in foreground a schermo intero.
 - **Soft Boot** (`main_banchetto_soft_cp.py` per CarPlay, `main_banchetto_soft_sleep_aa.py` per
   Android Auto): il device è già acceso, si simula solo il pulsante KL15 (un impulso singolo) e
   si verifica lo stesso passaggio grigio→verde + foreground.
+
+Questo README copre il branch **`main`**, che pilota il relè direttamente sui pin **GPIO** del
+Raspberry Pi tramite `gpiozero`. Il branch `ubuntu` fa la stessa cosa ma su una scheda relè
+USB-HID generica pilotata via CLI `usbrelay` (utile per girare su un PC/Ubuntu qualsiasi senza
+GPIO) — la logica di test è la stessa, cambia solo `pulse_relays()` in `banchetto_controller.py`.
 
 ---
 
@@ -23,17 +29,22 @@ modulo globale:
 
 | File | Ruolo |
 |---|---|
-| `banchetto_model.py` | Stato di sessione: `CONFIG` (parametri di test), timer (`session_start_perf`, `gray_detect_start_perf`, `second_relay_perf`...), timeline degli eventi (`mark_event`) |
+| `banchetto_model.py` | Stato di sessione: `CONFIG` (parametri di test), timer (`session_start_perf`, `gray_detect_start_perf`, `second_relay_perf`...), timeline degli eventi (`mark_event`), `cooldown_restart()` (attende tra un ciclo e il successivo **e** verifica attivamente che il banco sia spento prima di ripartire) |
 | `banchetto_view.py` | Tutto l'I/O di log e reportistica: log testuale di sessione, CSV di risultato (`append_csv`, `append_output_csv`, `append_deep_sleep_csv`) |
-| `banchetto_utils.py` | Azioni fisiche: cattura schermo via ADB (`capture_png`, `capture_frame_bgr`), analisi colore con OpenCV, tap/swipe/motionevent via `adb shell input`, impulsi relè via `usbrelay` |
-| `banchetto_controller.py` | Logica del test: connessione ADB, attesa grigio→verde, validazione schermata CarPlay/AA, i due loop principali (`run_deep_sleep_loop`, `run_soft_loop`) |
-| `main_banchetto_*.py` | Entry point: definiscono il `CONFIG` specifico del test (soglie, coordinate, path) e lanciano il loop corrispondente |
+| `banchetto_utils.py` | Azioni fisiche: cattura schermo via ADB (`capture_png`, `capture_frame_bgr`), analisi colore con OpenCV, tap/swipe/motionevent via `adb shell input` |
+| `banchetto_controller.py` | Logica del test: pilotaggio relè via GPIO (`pulse_relays`), connessione ADB (probe TCP + `adb connect`), attesa grigio→verde, validazione schermata CarPlay/AA, i due loop principali (`run_deep_sleep_loop`, `run_soft_loop`) |
+| `esoTraceLogger.py` | Avvia/ferma le acquisizioni esoTrace (jTraceCapture) per le partizioni SYS, IVI e ConMod, una per ciclo di test |
+| `main_banchetto_*.py` | Entry point: definiscono il `CONFIG` specifico del test (soglie, coordinate, path, pin relè) e lanciano il loop corrispondente |
 
 Ogni `main_*.py` è indipendente e lanciabile singolarmente: `python main_banchetto_deep_sleep_cp.py`.
 
+Tutti e quattro gli script condividono le stesse `wait_for_device()` / `end_of_test_relay_sequence()`
+nel controller, che è anche dove è agganciato esoTrace (vedi [§2.4](#24-prerequisiti-esotrace-logging-sys--ivi--conmod))
+— quindi la cattura delle trace è automatica per ogni ciclo di ogni script, senza wiring per-script.
+
 ---
 
-## 2. Requisiti di sistema (installazione da zero su un nuovo Ubuntu)
+## 2. Requisiti di sistema (installazione da zero su un nuovo Raspberry Pi)
 
 ### 2.1 Python e dipendenze
 
@@ -45,10 +56,12 @@ cd /path/al/progetto
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install gpiozero lgpio
 ```
 
-`requirements.txt` installa `opencv-python-headless`, `numpy` e `Pillow` — nessuna libreria
-Python è necessaria per il relè (gestito dal comando `usbrelay`, non da una libreria HID Python).
+`requirements.txt` installa `opencv-python-headless`, `numpy` e `Pillow`. `gpiozero` + `lgpio`
+pilotano i pin GPIO per il relè (non sono nel `requirements.txt` perché non servono sul branch
+`ubuntu`, che usa `usbrelay`).
 
 Ricordati di attivare il venv (`source venv/bin/activate`) in ogni nuova sessione di terminale
 prima di lanciare uno script.
@@ -57,11 +70,6 @@ prima di lanciare uno script.
 
 ```bash
 sudo apt install -y android-tools-adb
-```
-
-Verifica che sia raggiungibile semplicemente con:
-
-```bash
 adb version
 which adb
 ```
@@ -69,30 +77,66 @@ which adb
 Se il comando non è nel `PATH`, aggiorna il campo `ADB=` in ciascun `main_*.py` con il percorso
 assoluto dell'eseguibile.
 
-### 2.3 usbrelay (pilotaggio della scheda relè)
+### 2.3 Scheda relè GPIO
+
+Il relè è collegato direttamente ai pin GPIO del Raspberry Pi (board tipo Keyestudio a moduli
+relè) e pilotato a livello TTL tramite `gpiozero.LED`, **non** tramite `usbrelay` (quello serve
+solo per relay board USB-HID, usate sul branch `ubuntu`).
+
+**Se cambi board relè o pin di collegamento**, verifica prima quali pin GPIO attivano
+effettivamente il relè con lo script di supporto già presente nel repo:
 
 ```bash
-sudo apt install -y usbrelay
+python raspberry_relay.py   # cicla una serie di pin candidati, 1s ciascuno, osserva quale relè scatta
 ```
 
-`usbrelay`, lanciato senza argomenti, elenca tutte le schede relè collegate e il loro stato:
+Una volta identificati i due pin corretti, aggiornali in `CONFIG` nei `main_banchetto_*.py`:
 
-```bash
-usbrelay
+```python
+RELAY_CHANNEL_1=<pin_GPIO_BCM>,
+RELAY_CHANNEL_2=<pin_GPIO_BCM>,
+RELAY_ACTIVE_LOW=False,   # True se il relè si chiude portando il pin a LOW: va verificato empiricamente
 ```
 
-Se il comando dà errore di permessi (o richiede `sudo`), serve una regola udev che assegni i
-permessi corretti al dispositivo HID. Vedi la sezione [4.2](#42-cambiare-la-scheda-relè) più
-sotto per i dettagli su come crearla e su come trovare l'identificativo esatto della tua scheda.
-
-### 2.4 Verifica finale
-
-Con il banco collegato (relè via USB, infotainment raggiungibile in rete):
+Se i permessi sul gruppo `gpio` mancano, aggiungi l'utente al gruppo e riavvia la sessione:
 
 ```bash
-usbrelay                         # deve elencare la scheda senza errori
+sudo usermod -aG gpio $USER
+```
+
+### 2.4 Prerequisiti esoTrace (logging SYS / IVI / ConMod)
+
+Le acquisizioni esoTrace girano come `jtracecapture.jar` dentro finestre `lxterminal` dedicate,
+una per partizione. Serve:
+
+```bash
+sudo apt install -y default-jdk lxterminal wmctrl
+```
+
+- **`default-jdk`**: fornisce `java`, usato per eseguire `jtracecapture.jar`.
+- **`lxterminal`**: apre una finestra visibile per partizione (SYS/IVI/ConMod). **Richiede una
+  sessione grafica/X** sulla macchina che esegue il banco — non funziona su una sessione SSH
+  headless senza desktop environment.
+- **`wmctrl`**: chiude le finestre SYS/IVI/ConMod a fine ciclo. Non strettamente necessario — se
+  assente, i processi `java` vengono comunque terminati (via `pkill`), restano solo le finestre
+  vuote aperte.
+- **`jtracecapture.jar`** va posizionato nella cartella `jtrace/` alla radice del progetto (già
+  incluso in questo checkout). Non è gestito da `requirements.txt` — è uno strumento a parte.
+
+Se `java`, il jar o `lxterminal` mancano, `esoTraceLogger.py` logga un avviso chiaro e **salta la
+trace per quel ciclo senza bloccare il test** — un prerequisito esoTrace mancante non blocca mai
+il banco.
+
+### 2.5 Verifica finale
+
+Con il banco collegato (relè su GPIO, infotainment raggiungibile in rete):
+
+```bash
+python raspberry_relay.py        # deve azionare il relè sui pin attesi
 adb connect 172.16.250.248:5555  # deve confermare la connessione
 adb devices                      # il device deve apparire come "172.16.250.248:5555   device"
+java -version                    # deve stampare una versione JDK/JRE
+ls jtrace/jtracecapture.jar      # deve esistere
 ```
 
 Se tutto risponde correttamente, il banco è pronto per eseguire i test.
@@ -105,13 +149,20 @@ Se tutto risponde correttamente, il banco è pronto per eseguire i test.
 source venv/bin/activate
 
 python main_banchetto_deep_sleep_cp.py     # test Deep Sleep + CarPlay
+python main_banchetto_deep_sleep_aa.py     # test Deep Sleep + Android Auto
 python main_banchetto_soft_cp.py           # test Soft Boot + CarPlay
 python main_banchetto_soft_sleep_aa.py     # test Soft Boot + Android Auto
 ```
 
 Ogni script esegue un **loop infinito**: al termine di ogni ciclo (PASSED/FAILED/PARTIALLY
-FAILED) attende `RESTART_DELAY_SECONDS`, poi ricomincia automaticamente. Si interrompe con
-`Ctrl+C`.
+FAILED) attende `RESTART_DELAY_SECONDS` **e verifica che il banco sia effettivamente spento**
+prima di ricominciare (vedi [§5](#5-note-di-progettazione)), poi ricomincia automaticamente. Si
+interrompe con `Ctrl+C`.
+
+I due script Deep Sleep isolano il proprio traffico ADB su una porta server dedicata
+(`ANDROID_ADB_SERVER_PORT=5038`), così un `adb` lanciato a mano nel terminale (porta di default
+5037) non interferisce con il banco e non ne uccide il transport con un `kill-server` accidentale.
+Per ispezionare il server dedicato dall'esterno: `ANDROID_ADB_SERVER_PORT=5038 adb devices -l`.
 
 ### Struttura dell'output
 
@@ -119,7 +170,8 @@ Ogni lancio dello script crea/aggiorna, dentro `output/<Nome_Test>/`:
 
 - una cartella `cattura schermate_<timestamp>/` per ogni ciclo di test, contenente gli
   screenshot salvati durante quel ciclo (fase grigia, fase verde, controllo finale CarPlay,
-  eventuale frame di fallimento) e il log testuale `tempo_connessione.txt` di quel ciclo;
+  eventuale frame di fallimento, trace esoTrace se disponibili) e il log testuale
+  `tempo_connessione.txt` di quel ciclo;
 - uno o più CSV con **timestamp di lancio dello script** nel nome (es.
   `results_deepsleep_30_07_26_1547.csv`), che accumulano una riga per ogni ciclo eseguito in
   quella sessione. Un nuovo lancio dello script crea sempre un CSV nuovo, non sovrascrive né
@@ -188,7 +240,7 @@ o silenziosamente errata, senza un messaggio d'errore chiaro.
    CarPlay/Android Auto da monitorare (due display diversi possono avere la stessa risoluzione
    per coincidenza).
 
-5. Una volta confermato, aggiorna in **tutti e tre** i `main_banchetto_*.py`:
+5. Una volta confermato, aggiorna in **tutti** i `main_banchetto_*.py`:
 
    ```python
    SCREEN_DISPLAY_ID=<ID_fisico_confermato>,
@@ -197,72 +249,47 @@ o silenziosamente errata, senza un messaggio d'errore chiaro.
 L'ID fisico di un pannello è stabile nel tempo (deriva dall'hardware del display, non cambia
 al riavvio), quindi va aggiornato solo se cambi banco/infotainment fisico.
 
-### 4.2 Cambiare la scheda relè
+### 4.2 Cambiare la scheda relè / i pin GPIO
 
-I canali relè sono identificati da un nome tipo `QAAMZ_1` / `QAAMZ_2` (formato
-`<serial_scheda>_<numero_canale>`), usato da `usbrelay` per indirizzare il comando al relè
-giusto (rilevante se hai più schede collegate).
+I due canali relè sono identificati dal **numero di pin GPIO** (numerazione BCM) a cui sono
+collegati, usato da `gpiozero.LED` per pilotare il pin giusto.
 
-**Procedura per trovare gli identificativi della nuova scheda:**
+**Procedura per trovare i pin corretti su una nuova board:**
 
-1. Collega la scheda relè via USB.
+1. Collega la board relè ai pin GPIO del Raspberry Pi.
 
-2. Verifica che il sistema la veda a livello USB (le schede relè HID comuni usano il vendor ID
-   `16c0` e product ID `05df`):
-
-   ```bash
-   lsusb | grep -i "16c0:05df"
-   ```
-
-3. Elenca i canali disponibili con `usbrelay` (senza argomenti): stampa una riga per ogni relè
-   rilevato, nel formato `<SERIAL>_<NUMERO>=<STATO>` (0 = aperto, 1 = chiuso):
+2. Usa lo script di supporto `raspberry_relay.py` (alla radice del progetto) per ciclare una
+   lista di pin candidati e osservare quale relè scatta:
 
    ```bash
-   usbrelay
+   python raspberry_relay.py
    ```
 
-   Esempio di output:
-   ```
-   QAAMZ_1=0
-   QAAMZ_2=0
-   ```
+   Modifica la lista `candidate_pins` nello script per includere i pin che vuoi testare. Lo
+   script attiva ogni pin per 1 secondo: annota quale numero corrisponde a quale canale relè.
 
-   Il prefisso prima del `_` (qui `QAAMZ`) è il serial univoco di quella scheda — cambia da
-   scheda a scheda.
+3. Verifica anche la **polarità**: se il relè si chiude quando il pin va a HIGH, `RELAY_ACTIVE_LOW`
+   deve restare `False`; se invece si chiude quando il pin va a LOW, impostalo a `True`.
 
-4. Se il comando dà errore di permessi, serve una regola udev. Crea
-   `/etc/udev/rules.d/99-usbrelay.rules` con:
-
-   ```
-   SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="05df", MODE="0666"
-   KERNEL=="hidraw*", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="0666"
-   ```
-
-   poi ricarica le regole e riconnetti la scheda:
+4. Se i permessi sul gruppo `gpio` mancano (errore tipo `PermissionError` da `gpiozero`):
 
    ```bash
-   sudo udevadm control --reload-rules
-   sudo udevadm trigger
+   sudo usermod -aG gpio $USER
+   # poi disconnetti/riconnetti la sessione (o riavvia) perché il nuovo gruppo abbia effetto
    ```
 
-5. Verifica di poter azionare un canale manualmente:
-
-   ```bash
-   usbrelay QAAMZ_1=1   # chiude il relè 1
-   usbrelay QAAMZ_1=0   # lo riapre
-   ```
-
-6. Aggiorna in tutti i `main_banchetto_*.py` i due canali usati per simulare la pressione del
+5. Aggiorna in tutti i `main_banchetto_*.py` i due pin usati per simulare la pressione del
    pulsante:
 
    ```python
-   RELAY_CHANNEL_1="<SERIAL>_1",
-   RELAY_CHANNEL_2="<SERIAL>_2",
+   RELAY_CHANNEL_1=<pin_GPIO_BCM>,
+   RELAY_CHANNEL_2=<pin_GPIO_BCM>,
+   RELAY_ACTIVE_LOW=False,  # o True, in base al punto 3
    ```
 
 Se la nuova scheda ha un solo canale, o serve pilotarne solo uno, si può modificare
 `pulse_relays()` in `banchetto_controller.py` per usare un solo canale, oppure impostare
-entrambe le costanti allo stesso valore.
+entrambe le costanti allo stesso pin.
 
 ### 4.3 Cambiare infotainment/IP di rete
 
@@ -289,15 +316,18 @@ problemi più insidiosi da diagnosticare, perché ADB spesso non riporta un erro
 | `CARPLAY_SIMILARITY_THRESHOLD` | Soglia minima di similarità per considerare la schermata finale CarPlay/AA valida |
 | `FPS` | Frequenza di campionamento durante l'attesa grigio→verde |
 | `GREEN_TIMEOUT_SECONDS` | Timeout massimo di attesa del passaggio al verde prima di dichiarare fallito il ciclo |
-| `RESTART_DELAY_SECONDS` | Attesa tra un ciclo di test e il successivo |
+| `RESTART_DELAY_SECONDS` | Attesa tra un ciclo di test e il successivo (dopo la quale si verifica anche che il banco sia spento, vedi [§5](#5-note-di-progettazione)) |
 | `SECOND_RELAY_DELAY_SECONDS` | (solo deep sleep) Attesa tra il primo impulso relè (enabler/accensione) e il secondo (che avvia effettivamente lo startup se il sistema è in deep sleep — vedi [nota di progettazione](#5-note-di-progettazione)) |
 | `ADB_COMMAND_TIMEOUT_SECONDS` | Timeout per ogni singolo comando ADB (default 10s se non specificato); evita che uno screencap/tap bloccato congeli lo script |
+| `PORT_PROBE_TIMEOUT_SECONDS` / `PORT_PROBE_INTERVAL_SECONDS` | Timeout e intervallo del probe TCP "leggero" (non passa dal server adb) usato per rilevare quando la porta ADB del banco torna raggiungibile dopo il power-cycle |
+| `ADB_CONNECT_CMD_TIMEOUT_SECONDS` / `ADB_VERIFY_TIMEOUT_SECONDS` | Timeout duri per, rispettivamente, il comando `adb connect` e la successiva verifica dello stato `device` |
+| `DISCONNECT_CHECK_TIMEOUT_SECONDS` | (solo deep sleep) Timeout entro cui ci si aspetta che la porta ADB del banco smetta di rispondere dopo il click relay (conferma del power-cycle) |
 
 ---
 
 ## 5. Note di progettazione
 
-Due comportamenti del codice che potrebbero sembrare bug a prima vista, ma sono intenzionali:
+Alcuni comportamenti del codice che potrebbero sembrare bug a prima vista, ma sono intenzionali:
 
 - **Il timer di connessione parte dal secondo click relay, non dal primo (deep sleep)**: il
   primo impulso relè funge solo da **enabler** (accende il sistema), mentre è solo con il
@@ -311,6 +341,22 @@ Due comportamenti del codice che potrebbero sembrare bug a prima vista, ma sono 
   su questo banco non richiede l'ID display perché esiste un solo display touch — passare
   l'argomento in più risulta superfluo o viene ignorato. Se in futuro il banco dovesse avere più
   display touch, questo andrebbe rivisto aggiungendo `_input_display_args()` anche a `tap()`.
+- **La connessione ADB non fa più "spam" di `adb connect`**: il vecchio approccio lanciava
+  ripetutamente `adb connect` (o `adb devices`) contro il server adb, il che poteva accumulare
+  transport "zombie" dopo diversi power-cycle KL15 e mostrare errori tipo `already connected` su
+  un device in realtà non più raggiungibile. Ora `wait_for_device()` fa un **probe TCP puro**
+  (`device_port_open()`, un semplice `socket.create_connection` a 20-50 Hz) che non tocca mai il
+  server adb; solo quando la porta risponde viene lanciato **un solo** `adb connect` con timeout
+  duri (`adb_connect_and_verify()`), seguito da `wait-for-device` + `get-state` per confermare che
+  il transport sia realmente `device` e non solo `offline`/`connecting`. Il server adb viene anche
+  resettato (`reset_adb_server()`) prima di ogni ciclo, mentre il banco è ancora spento, così il
+  costo di riavvio del server non entra nella misura del tempo di connessione.
+- **Il cooldown tra un ciclo e l'altro verifica che il banco sia davvero spento**
+  (`cooldown_restart()` in `banchetto_model.py`): dopo l'attesa di `RESTART_DELAY_SECONDS`, uno
+  probe TCP controlla che la porta ADB del banco non risponda più. Se risponde ancora (banco
+  rimasto acceso), viene inviato un altro `pulse_relays()` e il countdown riparte da capo, finché
+  il banco non risulta confermato spento — evita di iniziare un nuovo ciclo di test partendo da
+  uno stato incoerente.
 
 ## 6. Troubleshooting rapido
 
@@ -318,6 +364,9 @@ Due comportamenti del codice che potrebbero sembrare bug a prima vista, ma sono 
 |---|---|---|
 | Screenshot vuoto/corrotto, `file` non lo riconosce come PNG | `SCREEN_DISPLAY_ID` sbagliato o mancante, display multipli | Sezione [4.1](#41-cambiare-il-display-da-catturare-screen_display_id) |
 | Script bloccato senza nuovi log dopo "Connessione ADB confermata" | `TARGET_SERIAL` senza porta, o comando ADB in attesa indefinita | Verifica che `TARGET_SERIAL` includa `:5555`; controlla `ADB_COMMAND_TIMEOUT_SECONDS` |
-| `usbrelay` dà errore di permessi | Regola udev assente/non caricata | Sezione [4.2](#42-cambiare-la-scheda-relè), punto 4 |
+| Relè non scatta / `RuntimeError: Libreria 'gpiozero' non disponibile` | `gpiozero`/`lgpio` non installati, o pin GPIO sbagliato | `pip install gpiozero lgpio`; Sezione [4.2](#42-cambiare-la-scheda-relè--i-pin-gpio) |
+| `PermissionError` durante `pulse_relays()` | Utente non nel gruppo `gpio` | Sezione [2.3](#23-scheda-relè-gpio), `sudo usermod -aG gpio $USER` e riavvia la sessione |
 | `adb: no devices/emulators found` | Device non connesso, IP cambiato, rete non raggiungibile | `adb connect <ip>:5555` manuale, controlla la rete verso il banco |
 | Tap/swipe non hanno effetto sullo schermo | Display multipli, evento indirizzato al pannello sbagliato | Verifica `_input_display_args()` in `banchetto_utils.py`, vedi nota su `tap()` sopra |
+| Nessuna finestra esoTrace si apre / trace mancanti | `java`/`lxterminal`/jar mancanti, o sessione headless senza X | Sezione [2.4](#24-prerequisiti-esotrace-logging-sys--ivi--conmod); il test prosegue comunque senza trace |
+| Il banco riparte subito dopo il click relay di fine test | `cooldown_restart()` ha rilevato la porta ADB ancora raggiungibile e ha reinviato `pulse_relays()` | Comportamento atteso, vedi [§5](#5-note-di-progettazione); verifica che il relè spenga davvero il banco |

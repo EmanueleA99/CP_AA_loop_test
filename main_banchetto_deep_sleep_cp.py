@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,11 @@ CONFIG = SimpleNamespace(
     CARPLAY_SIMILARITY_THRESHOLD=0.40,
     ADB_CONNECT_SPAM_INTERVAL=0.0,
     ADB_CONNECT_TIMEOUT_SECONDS=120,
-    ADB_SINGLE_CONNECT_TIMEOUT_SECONDS=0.5,
+    ADB_SINGLE_CONNECT_TIMEOUT_SECONDS=0.5,  # non piu' usato dal connect (resta per compatibilita')
+    PORT_PROBE_TIMEOUT_SECONDS=0.15,
+    PORT_PROBE_INTERVAL_SECONDS=0.02,
+    ADB_CONNECT_CMD_TIMEOUT_SECONDS=4,
+    ADB_VERIFY_TIMEOUT_SECONDS=3,
     RESTART_DELAY_SECONDS=240,
     GREEN_TIMEOUT_SECONDS=120,
     SECOND_RELAY_DELAY_SECONDS=1,
@@ -55,6 +60,11 @@ CONFIG = SimpleNamespace(
     SPECIAL_HOLD_BEFORE_SWIPE_MS=700,
     SPECIAL_TOTAL_SWIPE_MS=1400,
 )
+
+# Server adb DEDICATO al test: nessun altro tool (esoTrace, IDE, scrcpy, adb manuale) lo
+# condivide o lo uccide con un kill-server. Gli 'adb' lanciati a mano nel terminale useranno
+# la 5037: per ispezionare questo server usa `ANDROID_ADB_SERVER_PORT=5038 adb devices -l`.
+os.environ["ANDROID_ADB_SERVER_PORT"] = "5038"
 
 model.load_config(CONFIG)
 
