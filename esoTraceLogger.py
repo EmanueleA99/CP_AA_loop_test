@@ -42,6 +42,7 @@ try:
 except Exception:
     _HAS_MODEL = False
 
+ADB_SERIAL = "352425160185727" #write here adb serial of the conmod
 
 _processes = []
 
@@ -147,9 +148,9 @@ def _create_conmod_script(jar_path, output_dir):
     jTraceCapture va lanciato solo dopo che il forward è riuscito — altrimenti si connette
     a una porta locale non ancora aperta e fallisce silenziosamente.
     """
-    serial = "127.0.0.1"
+    serial = ADB_SERIAL
     if not serial:
-        _log("esoTrace: TARGET_SERIAL non disponibile in CONFIG, impossibile avviare ConMod (serve per l'adb forward)")
+        _log("esoTrace: ADB_SERIAL non disponibile, impossibile avviare ConMod - add adb serial of the conmod on esoTraceLogger.py line 45")
         return None
 
     adb = _adb_binary()
