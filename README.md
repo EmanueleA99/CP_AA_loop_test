@@ -56,6 +56,8 @@ cd /path/al/progetto
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+sudo apt install -y build-essential python3-dev swig liblgpio-dev
+pip install --upgrade pip setuptools wheel
 pip install gpiozero lgpio
 ```
 
