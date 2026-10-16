@@ -15,6 +15,8 @@ Difetti corretti rispetto allo script originale ricevuto:
   senza interrompere il banco (il test prosegue comunque, solo senza trace).
 - Il job "ConMod" era presente nel codice ma commentato: è stato riattivato
   perché il logging delle tre partizioni SYS, IVI e ConMod è quanto richiesto.
+- Il job ConMod ora passa da uno script dedicato che attende il port forward
+  ADB (tcp:21002) prima di avviare jTraceCapture, come nella versione corretta.
 - Aggiunto un controllo dei prerequisiti (java, jar, lxterminal) prima di
   lanciare i processi, con messaggi chiari nel log invece di fallimenti muti.
 """
@@ -47,10 +49,13 @@ JTRACE_DIR = Path(__file__).resolve().parent / "jtrace"
 JAR_NAME = "jtracecapture.jar"
 JAR_PATH = JTRACE_DIR / JAR_NAME
 
+# Parametri ADB per il port forward verso ConMod
+ADB_SERIAL = "352425160185727"
+ADB_PORT = "21002"
+
 _JOBS = [
     ("SYS", 'java -jar "{jar}" -o traceSYS.esotrace_#yyyyMMddhhmm# 172.16.250.248 -p 21005'),
     ("IVI", 'java -jar "{jar}" -o traceIVI.esotrace_#yyyyMMddhhmm# 172.16.250.248 -p 21002'),
-    ("ConMod", 'java -jar "{jar}" -o traceConMod.esotrace_#yyyyMMddhhmm# 127.0.0.1 -p 21002 -k 150'),
 ]
 
 
@@ -86,9 +91,10 @@ def _preflight_ok():
 
     return ok
 
+
 def _resolve_output_dir():
     """Determina dove devono atterrare i file di trace.
- 
+
     Preferisce model.session_dir (la cartella creata per il loop corrente,
     la stessa di screenshot e log testuale). Se per qualche motivo non è
     ancora disponibile, ripiega su JTRACE_DIR e lo segnala nel log, invece
@@ -105,9 +111,27 @@ def _resolve_output_dir():
             _log("esoTrace: model.session_dir non impostato, uso jtrace/ come fallback")
     else:
         _log("esoTrace: banchetto_model_ubuntu non disponibile, uso jtrace/ come fallback")
- 
+
     JTRACE_DIR.mkdir(parents=True, exist_ok=True)
     return JTRACE_DIR
+
+
+def _create_conmod_script(output_dir: Path, jar_path: Path) -> Path:
+    """Crea lo script per ConMod: attende il port forward ADB e poi avvia jTraceCapture."""
+    script_path = output_dir / "start_conmod.sh"
+    content = (
+        "#!/bin/bash\n"
+        f"cd \"{output_dir}\"\n"
+        f"echo \"[ConMod] In attesa del device {ADB_SERIAL}...\"\n"
+        f"until adb -s {ADB_SERIAL} forward tcp:{ADB_PORT} tcp:{ADB_PORT} 2>/dev/null; do\n"
+        "    sleep 1\n"
+        "done\n"
+        f"echo \"[ConMod] Port forward tcp:{ADB_PORT} attivo! Avvio jTraceCapture...\"\n"
+        f"java -jar \"{jar_path}\" -o traceConMod.esotrace_#yyyyMMddhhmm# 127.0.0.1 -p {ADB_PORT} -k 150\n"
+    )
+    script_path.write_text(content)
+    script_path.chmod(0o755)
+    return script_path
 
 
 def start_traces():
@@ -144,9 +168,31 @@ def start_traces():
         except Exception as e:
             _log(f"esoTrace: impossibile avviare acquisizione {title}: {e}")
 
+    # Avvio cattura ConMod tramite script dedicato (attende il port forward ADB)
+    try:
+        conmod_script = _create_conmod_script(output_dir, JAR_PATH.resolve())
+        p_conmod = subprocess.Popen(
+            [
+                "lxterminal",
+                "--title", "ConMod",
+                "--command", f"bash \"{conmod_script}\""
+            ],
+            cwd=str(output_dir)
+        )
+        _processes.append(p_conmod)
+        _log("esoTrace: avviata finestra ConMod con attesa connessione ADB")
+    except Exception as e:
+        _log(f"esoTrace: impossibile avviare acquisizione ConMod: {e}")
+
 
 def stop_traces():
     """Termina tutte le acquisizioni jTraceCapture attive e chiude le relative finestre."""
+    # Termina lo script di attesa ADB di ConMod, se ancora in esecuzione
+    try:
+        subprocess.run(["pkill", "-f", "start_conmod.sh"], check=False)
+    except Exception as e:
+        _log(f"esoTrace: errore durante pkill script ConMod: {e}")
+
     try:
         subprocess.run(["pkill", "-f", JAR_NAME], check=False)
     except Exception as e:
@@ -154,7 +200,7 @@ def stop_traces():
 
     time.sleep(1)
 
-    for title, _cmd in _JOBS:
+    for title in ["SYS", "IVI", "ConMod"]:
         try:
             subprocess.run(["wmctrl", "-c", title], check=False)
         except FileNotFoundError:
