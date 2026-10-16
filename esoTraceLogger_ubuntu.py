@@ -123,9 +123,8 @@ def _create_conmod_script(output_dir: Path, jar_path: Path) -> Path:
         "#!/bin/bash\n"
         f"cd \"{output_dir}\"\n"
         f"echo \"[ConMod] In attesa del device {ADB_SERIAL}...\"\n"
-        f"until adb -s {ADB_SERIAL} forward tcp:{ADB_PORT} tcp:{ADB_PORT} 2>/dev/null; do\n"
-        "    sleep 1\n"
-        "done\n"
+        f"adb -s {ADB_SERIAL} wait-for-device\n"
+        f"adb -s {ADB_SERIAL} forward tcp:{ADB_PORT} tcp:{ADB_PORT}\n"
         f"echo \"[ConMod] Port forward tcp:{ADB_PORT} attivo! Avvio jTraceCapture...\"\n"
         f"java -jar \"{jar_path}\" -o traceConMod.esotrace_#yyyyMMddhhmm# 127.0.0.1 -p {ADB_PORT} -k 150\n"
     )
